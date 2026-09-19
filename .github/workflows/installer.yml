@@ -17,9 +17,6 @@ jobs:
       with:
         targets: aarch64-linux-android
 
-    - name: Ensure Android target is installed for the pinned toolchain
-      run: rustup target add --toolchain 1.68.0 aarch64-linux-android
-
     - name: Cache Rust build
       uses: Swatinem/rust-cache@v2
 
@@ -29,17 +26,49 @@ jobs:
     - name: Download Dokan Installer
       run: curl -L --retry 10 --retry-all-errors -o ./installer/Dokan_x64.msi https://github.com/dokan-dev/dokany/releases/download/v1.5.1.1000/Dokan_x64.msi
 
-    - name: Force update sysinfo to 0.26.4 (uses ntapi 0.4, fixes E0793)
-      run: cargo update -p sysinfo --precise 0.26.4
+    - name: Patch Cargo.toml to use sysinfo 0.26.4
+      shell: pwsh
+      run: |
+        $cargo = Get-Content Cargo.toml -Raw
+        $cargo = $cargo -replace 'sysinfo\s*=\s*"[^"]*"', 'sysinfo = "0.26.4"'
+        Set-Content Cargo.toml $cargo -NoNewline
+        Write-Host "Patched Cargo.toml:" -ForegroundColor Cyan
+        Get-Content Cargo.toml | Select-String "sysinfo"
 
-    - name: Install cargo-ndk (v3.4.0, MSRV 1.68)
-      run: cargo install cargo-ndk --version 3.4.0 --locked
+    - name: Regenerate Cargo.lock
+      run: cargo update
+
+    - name: Install cargo-ndk (prebuilt binary)
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-ndk
+
+    - name: Verify cargo-ndk
+      run: cargo ndk --version
 
     - name: Compile AndroidFS
       run: ./build.ps1
 
     - name: Compile Installer
       run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /f installer/installer.iss'
+
+    - name: Verify build artifacts
+      shell: pwsh
+      run: |
+        $ok = $true
+        if (Test-Path ./target/release/*.exe) {
+          Write-Host "OK: standalone .exe found" -ForegroundColor Green
+        } else {
+          Write-Host "::error::standalone .exe not found"
+          $ok = $false
+        }
+        if (Test-Path ./installer/*.exe) {
+          Write-Host "OK: installer .exe found" -ForegroundColor Green
+        } else {
+          Write-Host "::error::installer .exe not found"
+          $ok = $false
+        }
+        if (-not $ok) { exit 1 }
 
     - name: Upload standalone
       uses: actions/upload-artifact@v4
