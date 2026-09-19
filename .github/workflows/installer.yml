@@ -12,8 +12,8 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Install Rust stable + Android target
-      uses: dtolnay/rust-toolchain@stable
+    - name: Install Rust nightly + Android target
+      uses: dtolnay/rust-toolchain@nightly
       with:
         targets: aarch64-linux-android
 
