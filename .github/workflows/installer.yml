@@ -26,8 +26,8 @@ jobs:
     - name: Download Dokan Installer
       run: curl -L --retry 10 --retry-all-errors -o ./installer/Dokan_x64.msi https://github.com/dokan-dev/dokany/releases/download/v1.5.1.1000/Dokan_x64.msi
 
-    - name: Install cargo-ndk (v3.4.0, compatible with Rust 1.68)
-      run: cargo install cargo-ndk --version 3.4.0
+    - name: Install cargo-ndk (v3.4.0, MSRV 1.68, not yanked)
+      run: cargo install cargo-ndk --version 3.4.0 --locked
 
     - name: Compile AndroidFS
       run: ./build.ps1
