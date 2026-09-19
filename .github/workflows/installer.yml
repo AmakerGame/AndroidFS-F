@@ -1,8 +1,6 @@
 name: Windows Installer
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -35,13 +33,15 @@ jobs:
       run: ./build.ps1
     - name: Compile Installer
       run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /f installer/installer.iss'
+
     - name: Standalone upload
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       with:
         name: standalone
         path: ./target/release/*.exe
+
     - name: Installer Upload
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       with:
         name: installer
         path: ./installer/*.exe
