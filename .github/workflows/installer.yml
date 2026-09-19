@@ -12,8 +12,8 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Install Rust 1.68.0 + Android target
-      uses: dtolnay/rust-toolchain@1.68.0
+    - name: Install Rust stable + Android target
+      uses: dtolnay/rust-toolchain@stable
       with:
         targets: aarch64-linux-android
 
@@ -38,6 +38,7 @@ jobs:
         Get-Content Cargo.toml | Select-String "sysinfo"
 
     - name: Remove Cargo.lock to force re-resolution
+      shell: pwsh
       run: if (Test-Path Cargo.lock) { Remove-Item Cargo.lock }
 
     - name: Install cargo-ndk (prebuilt binary)
@@ -57,10 +58,8 @@ jobs:
         $path = "target/aarch64-linux-android/release/androidfs_server"
         if (Test-Path $path) {
           Write-Host "OK: $path exists" -ForegroundColor Green
-          Get-Item $path | Format-List Name, Length
         } else {
           Write-Host "::error::$path not found"
-          Write-Host "Looking for androidfs_server in target/:"
           Get-ChildItem target -Recurse -Filter "androidfs_server*" -ErrorAction SilentlyContinue | Select-Object FullName
           exit 1
         }
