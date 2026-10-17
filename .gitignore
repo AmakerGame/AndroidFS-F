@@ -1,6 +1,5 @@
-target/
-.vscode/
-Cargo.lock
-*.old
-*.exe
-*.msi
+node_modules/
+.project_id
+.github_repo
+.env
+.env.*

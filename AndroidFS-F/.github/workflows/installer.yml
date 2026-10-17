@@ -1,0 +1,70 @@
+name: Windows Installer
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build installer
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust stable + Android target
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-linux-android
+
+    - name: Cache Rust build
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install Android NDK
+      id: setup-ndk
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r26d
+
+    - name: Install Inno Setup via Chocolatey
+      run: choco install innosetup --yes --no-progress
+
+    - name: Download Dokan Installer
+      run: curl -L --retry 10 --retry-all-errors -o ./installer/Dokan_x64.msi https://github.com/dokan-dev/dokany/releases/download/v1.5.1.1000/Dokan_x64.msi
+
+    - name: Install cargo-ndk
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-ndk
+
+    - name: Build Android server (arm64-v8a)
+      env:
+        ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+      run: cargo ndk -t arm64-v8a build --release --bin androidfs_server
+
+    - name: Verify server binary exists
+      shell: pwsh
+      run: |
+        $path = "target/aarch64-linux-android/release/androidfs_server"
+        if (-not (Test-Path $path)) {
+          Write-Host "::error::$path not found"
+          exit 1
+        }
+
+    - name: Build Windows driver
+      run: cargo build --release --bin androidfs_driver
+
+    - name: Compile Installer
+      run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer/installer.iss'
+
+    - name: Upload standalone
+      uses: actions/upload-artifact@v4
+      with:
+        name: standalone
+        path: ./target/release/androidfs_driver.exe
+
+    - name: Upload installer
+      uses: actions/upload-artifact@v4
+      with:
+        name: installer
+        path: ./installer/*.exe

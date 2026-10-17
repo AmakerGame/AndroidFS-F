@@ -1,0 +1,12 @@
+AndroidFS-F is installed.
+
+Plug in an Android phone with USB debugging allowed. It is mounted automatically
+as the first free drive letter, starting at Q:.
+
+The mounted root is the phone's shared storage (/storage/emulated/0), not the
+raw system root. Set ANDROIDFS_ROOT to another absolute path before starting
+the driver if you need a different tree.
+
+If a device does not appear, set ANDROIDFS_CONSOLE=1 and RUST_LOG=info, restart,
+and read androidfs.log next to androidfs_driver.exe. adb.exe must be on PATH
+or pointed to by ANDROIDFS_ADB.
