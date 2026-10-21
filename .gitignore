@@ -1,5 +1,5 @@
-node_modules/
-.project_id
-.github_repo
-.env
-.env.*
+target/
+.vscode/
+*.exe
+*.msi
+*.log

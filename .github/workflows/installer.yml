@@ -1,0 +1,114 @@
+name: Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    name: Test daemon logic
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - name: Run tests
+      run: cargo test --lib
+
+  build:
+    name: Build installer
+    runs-on: windows-latest
+    needs: test
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust stable + Android target
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-linux-android
+
+    - name: Cache Rust build
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install Android NDK
+      id: setup-ndk
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r26d
+
+    - name: Install Inno Setup via Chocolatey
+      run: choco install innosetup --yes --no-progress
+
+    - name: Download Dokan Installer
+      run: curl -L --fail --retry 10 --retry-all-errors -o ./installer/Dokan_x64.msi https://github.com/dokan-dev/dokany/releases/download/v1.5.1.1000/Dokan_x64.msi
+
+    # dokan-sys links against dokan1.lib, so Dokan must be present on the build machine.
+    - name: Install Dokan on the runner (for linking)
+      shell: pwsh
+      run: |
+        $msi = (Resolve-Path ./installer/Dokan_x64.msi).Path
+        $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+        if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+          Write-Host "::error::Dokan MSI install failed with exit code $($p.ExitCode)"
+          exit 1
+        }
+        $lib = Get-ChildItem "C:\Program Files\Dokan" -Recurse -Filter dokan1.lib -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $lib) {
+          Write-Host "::error::dokan1.lib not found after installing Dokan"
+          exit 1
+        }
+        $libDir = $lib.DirectoryName
+        $root = (Get-Item $libDir).Parent.FullName + "\"
+        Write-Host "dokan1.lib: $($lib.FullName)"
+        "DokanLibrary1=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "LIB=$libDir;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+    - name: Install cargo-ndk
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-ndk
+
+    - name: Build Android server (arm64-v8a)
+      env:
+        ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+      run: cargo ndk -t arm64-v8a build --release --bin androidfs_server
+
+    - name: Verify server binary exists
+      shell: pwsh
+      run: |
+        $path = "target/aarch64-linux-android/release/androidfs_server"
+        if (-not (Test-Path $path)) {
+          Write-Host "::error::$path not found"
+          exit 1
+        }
+
+    - name: Build Windows driver
+      run: cargo build --release --bin androidfs_driver
+
+    - name: Verify driver binary exists
+      shell: pwsh
+      run: |
+        if (-not (Test-Path "target/release/androidfs_driver.exe")) {
+          Write-Host "::error::androidfs_driver.exe not found"
+          exit 1
+        }
+
+    - name: Compile Installer
+      shell: pwsh
+      run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer/installer.iss'
+
+    - name: Upload standalone
+      uses: actions/upload-artifact@v4
+      with:
+        name: standalone
+        path: ./target/release/androidfs_driver.exe
+
+    - name: Upload installer
+      uses: actions/upload-artifact@v4
+      with:
+        name: installer
+        path: ./installer/*.exe
