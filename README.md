@@ -10,13 +10,12 @@
 
 <p align="center">
   <a href="https://github.com/AmakerGame/AndroidFS-F/actions/workflows/installer.yml"><img alt="Build" src="https://github.com/AmakerGame/AndroidFS-F/actions/workflows/installer.yml/badge.svg"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.3.0-3DDC84">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20Android-informational">
   <img alt="License" src="https://img.shields.io/badge/license-GPL--3.0-blue">
 </p>
 
 <p align="center">
-  English · <a href="README.uk.md">Українська</a>
+  English · <a href="README.uk.md">Українська</a> · <a href="README.ru.md">Русский</a>
 </p>
 
 ---
@@ -25,7 +24,7 @@
 
 AndroidFS-F is a fork of [AndroidFS](https://github.com/Lauriethefish/AndroidFS). It runs a small daemon on the phone and exposes the phone's storage to Windows through the [Dokan](https://dokan-dev.github.io/) user-mode file system driver. The phone then appears in Explorer with its own drive letter and works with any Windows program.
 
-Version 0.3 adds a desktop application with a device list and controls, support for 32-bit ARM phones, and a set of stability fixes.
+This fork adds a desktop application with a device list and controls, support for 32-bit ARM phones and Windows 7, and a set of stability fixes.
 
 ## Features
 
@@ -137,27 +136,17 @@ Open the **Log** tab, or `%APPDATA%\AndroidFS-F\androidfs.log`, for details.
 - Only `arm64-v8a` and `armeabi-v7a` phones are supported.
 - File security descriptors and alternate data streams are not supported.
 
-## Changelog
+## What this fork changes
 
-**0.3.0**
-
-- Windows 7 SP1 support through the `x86_64-win7-windows-msvc` build target.
-- New desktop window with device list, mount / unmount / open actions, settings and log viewer.
-- Support for `armeabi-v7a` (32-bit ARM) phones next to `arm64-v8a`.
-- Application icon, English documentation, installer options for autostart and a desktop shortcut.
-- Settings and log moved to `%APPDATA%\AndroidFS-F`.
-
-**0.2.1**
-
-- Fixed the Windows build (daemon modules are Unix-only) and the GitHub Actions pipeline.
-- Write failures such as a full disk are reported to Windows instead of dropping the connection.
-- Symbolic links to directories are shown as directories.
-
-**0.2.0**
-
-- Implemented file and folder creation, writing, truncating and safe deletion in the daemon.
+- Desktop application with a device list, mount / unmount / open actions, settings and a log viewer.
+- Support for 32-bit ARM (`armeabi-v7a`) phones next to `arm64-v8a`.
+- Windows application built for Windows 7 SP1 and newer.
+- Application icon, installer options for autostart and a desktop shortcut.
+- File and folder creation, writing, truncating and safe deletion are implemented in the daemon.
+- Write failures such as a full disk are reported to Windows instead of dropping the drive.
 - Fixed a panic on reads past the end of a file and wrong status codes for missing files.
 - The drive root is the phone's shared storage; ADB failures no longer stop the application.
+- Symbolic links to directories are shown as directories.
 
 ## License
 
