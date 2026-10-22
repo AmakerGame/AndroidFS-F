@@ -78,6 +78,25 @@ jobs:
       with:
         tool: cargo-ndk
 
+    # windows-targets 0.48 wires up its import library (windows.0.48.5.lib) only for the exact
+    # x86_64-pc-windows-msvc triple, so the win7 target cannot find it. Download all crates and
+    # add the folders that contain those libraries to LIB for the linker.
+    - name: Make Windows import libraries visible to the linker
+      shell: pwsh
+      run: |
+        cargo fetch
+        $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+        $dirs = Get-ChildItem (Join-Path $cargoHome "registry\src") -Directory -ErrorAction SilentlyContinue |
+          ForEach-Object { Get-ChildItem $_.FullName -Directory -Filter "windows_x86_64_msvc-*" } |
+          ForEach-Object { Get-ChildItem $_.FullName -Recurse -File -Filter "windows*.lib" } |
+          ForEach-Object { $_.DirectoryName } | Sort-Object -Unique
+        if (-not $dirs) {
+          Write-Host "::error::no windows_x86_64_msvc import libraries found under $cargoHome"
+          exit 1
+        }
+        $dirs | ForEach-Object { Write-Host "import lib dir: $_" }
+        "LIB=$($dirs -join ';');$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
     - name: Build Android server (arm64-v8a, armeabi-v7a)
       env:
         ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
