@@ -38,7 +38,7 @@ Name: "autostart"; Description: "Start AndroidFS-F with Windows (minimized)"; Gr
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
 
 [Files]
-Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\x86_64-win7-windows-msvc\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: ".\Dokan_x64.msi"; DestDir: "{tmp}"; DestName: "Dokan_x64.msi"; Flags: deleteafterinstall
 
 [Run]

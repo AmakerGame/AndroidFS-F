@@ -41,7 +41,7 @@ Version 0.3 adds a desktop application with a device list and controls, support 
 
 | Component | Requirement |
 |-----------|-------------|
-| Windows | 10 or 11, 64-bit |
+| Windows | 7 SP1 or newer, 64-bit (Windows 7 needs the SHA-2 driver signing update for Dokan) |
 | Driver | [Dokan 1.5.x](https://github.com/dokan-dev/dokany/releases/tag/v1.5.1.1000) (installed by the installer) |
 | ADB | `adb.exe` from [Android platform-tools](https://developer.android.com/tools/releases/platform-tools), on `PATH` or set in Settings |
 | Phone | Android with **USB debugging** enabled, `arm64-v8a` or `armeabi-v7a` |
@@ -85,15 +85,16 @@ Command-line options for `androidfs_driver.exe`:
 
 ## Building from source
 
-Prerequisites: stable Rust, [cargo-ndk](https://github.com/bbqsrc/cargo-ndk), the Android NDK (`ANDROID_NDK_HOME` set), Dokan 1.5.x with its development files, and the Windows SDK.
+Prerequisites: nightly Rust with `rust-src` (the Windows app is built for `x86_64-win7-windows-msvc`, so it also runs on Windows 7), [cargo-ndk](https://github.com/bbqsrc/cargo-ndk), the Android NDK (`ANDROID_NDK_HOME` set), Dokan 1.5.x with its development files, and the Windows SDK.
 
 ```powershell
-rustup target add aarch64-linux-android armv7-linux-androideabi
+rustup toolchain install nightly --component rust-src
+rustup +nightly target add aarch64-linux-android armv7-linux-androideabi
 cargo install cargo-ndk
 ./build.ps1
 ```
 
-The script first builds the Android daemon for both ABIs, then builds the Windows application that embeds them with `include_bytes!`. The result is `target/release/androidfs_driver.exe`.
+The script first builds the Android daemon for both ABIs, then builds the Windows application that embeds them with `include_bytes!`. The result is `target/x86_64-win7-windows-msvc/release/androidfs_driver.exe`.
 
 The daemon logic and the wire protocol can be tested without a phone or Windows:
 
@@ -140,6 +141,7 @@ Open the **Log** tab, or `%APPDATA%\AndroidFS-F\androidfs.log`, for details.
 
 **0.3.0**
 
+- Windows 7 SP1 support through the `x86_64-win7-windows-msvc` build target.
 - New desktop window with device list, mount / unmount / open actions, settings and log viewer.
 - Support for `armeabi-v7a` (32-bit ARM) phones next to `arm64-v8a`.
 - Application icon, English documentation, installer options for autostart and a desktop shortcut.

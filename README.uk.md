@@ -34,7 +34,7 @@ AndroidFS-F — форк [AndroidFS](https://github.com/Lauriethefish/AndroidFS)
 
 | Компонент | Вимога |
 |-----------|--------|
-| Windows | 10 або 11, 64-бітна |
+| Windows | 7 SP1 або новіша, 64-бітна (для Dokan на Windows 7 потрібне оновлення підписів SHA-2) |
 | Драйвер | [Dokan 1.5.x](https://github.com/dokan-dev/dokany/releases/tag/v1.5.1.1000) (ставить інсталятор) |
 | ADB | `adb.exe` з [platform-tools](https://developer.android.com/tools/releases/platform-tools) у `PATH` або вказаний у налаштуваннях |
 | Телефон | Android з увімкненим **налагодженням USB**, `arm64-v8a` або `armeabi-v7a` |
@@ -74,15 +74,16 @@ AndroidFS-F — форк [AndroidFS](https://github.com/Lauriethefish/AndroidFS)
 
 ## Збірка
 
-Потрібні: стабільний Rust, [cargo-ndk](https://github.com/bbqsrc/cargo-ndk), Android NDK (змінна `ANDROID_NDK_HOME`), Dokan 1.5.x із файлами для розробки та Windows SDK.
+Потрібні: nightly Rust з `rust-src` (програма збирається під `x86_64-win7-windows-msvc`, тому працює і на Windows 7), [cargo-ndk](https://github.com/bbqsrc/cargo-ndk), Android NDK (змінна `ANDROID_NDK_HOME`), Dokan 1.5.x із файлами для розробки та Windows SDK.
 
 ```powershell
-rustup target add aarch64-linux-android armv7-linux-androideabi
+rustup toolchain install nightly --component rust-src
+rustup +nightly target add aarch64-linux-android armv7-linux-androideabi
 cargo install cargo-ndk
 ./build.ps1
 ```
 
-Спочатку збираються демони для двох архітектур, потім програма Windows, яка вбудовує їх через `include_bytes!`. Результат: `target/release/androidfs_driver.exe`. Логіку демона і протокол можна перевірити без телефону командою `cargo test --lib`.
+Спочатку збираються демони для двох архітектур, потім програма Windows, яка вбудовує їх через `include_bytes!`. Результат: `target/x86_64-win7-windows-msvc/release/androidfs_driver.exe`. Логіку демона і протокол можна перевірити без телефону командою `cargo test --lib`.
 
 ## Усунення проблем
 

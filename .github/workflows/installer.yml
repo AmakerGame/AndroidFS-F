@@ -26,10 +26,13 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Install Rust stable + Android targets
-      uses: dtolnay/rust-toolchain@stable
+    # The x86_64-win7-windows-msvc target (Windows 7 compatible exe) is tier 3:
+    # it has no prebuilt std, so it needs nightly + rust-src + -Zbuild-std.
+    - name: Install Rust nightly + Android targets
+      uses: dtolnay/rust-toolchain@nightly
       with:
         targets: aarch64-linux-android,armv7-linux-androideabi
+        components: rust-src
 
     - name: Cache Rust build
       uses: Swatinem/rust-cache@v2
@@ -90,13 +93,13 @@ jobs:
           }
         }
 
-    - name: Build Windows driver
-      run: cargo build --release --bin androidfs_driver
+    - name: Build Windows driver (Windows 7 compatible)
+      run: cargo build --release --bin androidfs_driver --target x86_64-win7-windows-msvc -Zbuild-std
 
     - name: Verify driver binary exists
       shell: pwsh
       run: |
-        if (-not (Test-Path "target/release/androidfs_driver.exe")) {
+        if (-not (Test-Path "target/x86_64-win7-windows-msvc/release/androidfs_driver.exe")) {
           Write-Host "::error::androidfs_driver.exe not found"
           exit 1
         }
@@ -109,7 +112,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: standalone
-        path: ./target/release/androidfs_driver.exe
+        path: ./target/x86_64-win7-windows-msvc/release/androidfs_driver.exe
 
     - name: Upload installer
       uses: actions/upload-artifact@v4
