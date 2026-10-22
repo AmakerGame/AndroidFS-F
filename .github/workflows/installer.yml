@@ -51,13 +51,16 @@ jobs:
       shell: pwsh
       run: |
         $msi = (Resolve-Path ./installer/Dokan_x64.msi).Path
-        $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+        $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" ADDLOCAL=ALL /qn /norestart" -Wait -PassThru
         if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
           Write-Host "::error::Dokan MSI install failed with exit code $($p.ExitCode)"
           exit 1
         }
-        $lib = Get-ChildItem "C:\Program Files\Dokan" -Recurse -Filter dokan1.lib -ErrorAction SilentlyContinue | Select-Object -First 1
+        $roots = @("C:\Program Files\Dokan", "C:\Program Files (x86)\Dokan") | Where-Object { Test-Path $_ }
+        $lib = $roots | ForEach-Object { Get-ChildItem $_ -Recurse -Filter dokan1.lib -ErrorAction SilentlyContinue } | Select-Object -First 1
         if (-not $lib) {
+          Write-Host "Installed Dokan files:"
+          $roots | ForEach-Object { Get-ChildItem $_ -Recurse | ForEach-Object { $_.FullName } }
           Write-Host "::error::dokan1.lib not found after installing Dokan"
           exit 1
         }
