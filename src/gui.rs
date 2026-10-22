@@ -32,10 +32,11 @@ struct App {
     form: Settings,
     autostart: bool,
     note: Option<(bool, String)>,
+    minimize_on_start: bool,
 }
 
 impl App {
-    fn new(shared: SharedState) -> Self {
+    fn new(shared: SharedState, minimize_on_start: bool) -> Self {
         let form = service::lock(&shared).settings.clone();
         App {
             shared,
@@ -43,6 +44,7 @@ impl App {
             form,
             autostart: settings::autostart_enabled(),
             note: None,
+            minimize_on_start,
         }
     }
 
@@ -309,6 +311,11 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(500));
 
+        if self.minimize_on_start {
+            self.minimize_on_start = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+
         let (devices, adb_error, adb_in_use) = {
             let guard = service::lock(&self.shared);
             (
@@ -422,8 +429,7 @@ pub fn run() {
             .with_title("AndroidFS-F")
             .with_inner_size([900.0, 580.0])
             .with_min_inner_size([700.0, 420.0])
-            .with_icon(Arc::new(load_icon()))
-            .with_minimized(background),
+            .with_icon(Arc::new(load_icon())),
         ..Default::default()
     };
 
@@ -437,7 +443,7 @@ pub fn run() {
             style.spacing.button_padding = egui::vec2(12.0, 6.0);
             cc.egui_ctx.set_style(style);
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            Box::new(App::new(app_shared))
+            Box::new(App::new(app_shared, background))
         }),
     );
     if let Err(err) = result {
