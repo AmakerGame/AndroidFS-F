@@ -1,70 +1,162 @@
-# AndroidFS-F 0.2.1
+<p align="center">
+  <img src="assets/icon.png" alt="AndroidFS-F" width="128" height="128">
+</p>
 
-Форк [AndroidFS](https://github.com/Lauriethefish/AndroidFS). Монтує Android-пристрій як диск Windows через ADB і Dokan, без MTP.
+<h1 align="center">AndroidFS-F</h1>
 
-Версія 0.2 виправляє альфа-код, через який диск або не з’являвся, або зникав під час звичайної роботи Провідника. Протокол демона (створення, запис, читання, обрізання, видалення) перевірено тестами.
+<p align="center">
+  Mount an Android phone as a regular Windows drive over ADB. No MTP, no extra apps on the phone.
+</p>
 
-## Зміни у 0.2.1
+<p align="center">
+  <a href="https://github.com/AmakerGame/AndroidFS-F/actions/workflows/installer.yml"><img alt="Build" src="https://github.com/AmakerGame/AndroidFS-F/actions/workflows/installer.yml/badge.svg"></a>
+  <img alt="Version" src="https://img.shields.io/badge/version-0.3.0-3DDC84">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20Android-informational">
+  <img alt="License" src="https://img.shields.io/badge/license-GPL--3.0-blue">
+</p>
 
-- **Збірка на Windows.** Модулі демона (`fs_ops`, `server`) використовують `std::os::unix` і `libc::statvfs`, але компілювались і для Windows, тому `cargo build --bin androidfs_driver` падав. Тепер вони під `#[cfg(unix)]`, а `libc` підключається лише для Unix.
-- **GitHub Actions.** Додано крок установки Dokan на runner (для лінкування `dokan1.lib`), окрему перевірку, що `androidfs_driver.exe` справді зібрався, окреме завдання `cargo test` на Linux і запуск при `push` та `pull_request`.
-- **Запис.** Раніше демон підтверджував запис ще до виконання, а при помилці (диск повний, немає прав) розривав з'єднання, і диск зникав. Тепер демон відповідає після запису, помилка доходить до Windows, диск лишається. Великі записи йдуть шматками по 1 МіБ.
-- **Символічні посилання** на каталоги показуються як каталоги.
-- **Повторне монтування** після невдачі чекає 5 с, а не крутиться без паузи.
-- Інсталятор видаляє тимчасовий Dokan MSI після встановлення.
+<p align="center">
+  English · <a href="README.uk.md">Українська</a>
+</p>
 
-## Що було зламано у 0.2
+---
 
-- Створення файлу і каталогу на демоні було `todo!()`: перша спроба щось записати вбивала процес на телефоні, і диск відпадав.
-- Читання за кінцем файлу віднімало довжину без перевірки і панікувало. Провідник так читає постійно.
-- `delete_file` видаляв одразу і рекурсивно (`remove_dir_all`), хоча Dokan лише *питає*, чи можна видалити, а саме видалення робить у `cleanup`, коли стоїть delete-on-close. Через порожній `create_file` це ще й ніколи не викликалось.
-- `FileNotFound` віддавався Windows як `STATUS_INVALID_DEVICE_REQUEST`, тож Провідник не розумів, що файлу немає.
-- Демон запускався як `./data/local/tmp/androidfs_server`. Повторний `adb push` не міг перезаписати файл з правами `555`, якщо попередній процес ще тримав бінарник.
-- `adb devices` з помилкою або відсутній `adb.exe` робили `unwrap` і завершували драйвер. Список пристроїв не відсікав `unauthorized`.
-- Дві літери диска могли бути обрані одночасно, бо перевірка `Q:\` відбувалася до завершення монтування.
-- Вільне місце шукалося лише на точці монтування `/storage/emulated`, якої на пристрої зазвичай немає, тому запис із деяких програм не починався.
-- Прапорці тому обіцяли ACL і альтернативні потоки, а відповідні виклики повертали «не реалізовано».
+## Overview
 
-## Що змінилось
+AndroidFS-F is a fork of [AndroidFS](https://github.com/Lauriethefish/AndroidFS). It runs a small daemon on the phone and exposes the phone's storage to Windows through the [Dokan](https://dokan-dev.github.io/) user-mode file system driver. The phone then appears in Explorer with its own drive letter and works with any Windows program.
 
-- Демон реалізує створення файлу і каталогу, відкриття лише для читання, запис у кінець, обрізання, безпечне видалення (без рекурсії, корінь змонтованого диска видалити не можна).
-- Корінь диска — спільне сховище телефону: `/storage/emulated/0`, інакше `/sdcard`. Інший каталог: змінна `ANDROIDFS_ROOT` (лише абсолютний шлях без пробілів).
-- Шлях `..` не виходить за цей корінь.
-- Драйвер шукає `adb.exe` в `ANDROIDFS_ADB`, `ANDROID_HOME`, `ANDROID_SDK_ROOT` і `%LOCALAPPDATA%\Android\Sdk\platform-tools`.
-- Помилка ADB більше не валить процес: повтор через кілька секунд.
-- Перед push старий демон зупиняється, порт `adb forward` знімається, з’єднання чекає до ~10 с.
-- Пристрої не `arm64-v8a` отримують явну помилку в лог, а не тихий обрив.
-- Без консолі лог пишеться в `androidfs.log` поруч із exe. `ANDROIDFS_CONSOLE=1` лишає вікно.
-- Збірка на стабільному Rust. `fn_traits` і nightly більше не потрібні.
-- Інсталятор кладе Dokan MSI в `{tmp}` і запускає саме його. Раніше msiexec шукав файл не там.
+Version 0.3 adds a desktop application with a device list and controls, support for 32-bit ARM phones, and a set of stability fixes.
 
-## Збірка
+## Features
 
-1. [Dokan 1.5.1](https://github.com/dokan-dev/dokany/releases/tag/v1.5.1.1000) (саме 1.5: крейт `dokan` 0.2 зібраний проти нього).
-2. [rustup](https://rustup.rs/) зі стабільним toolchain.
-3. Android NDK, змінна `ANDROID_NDK_HOME`.
-4. `rustup target add aarch64-linux-android` і `cargo install cargo-ndk`.
-5. `./build.ps1`
+- **Desktop application.** A window with the list of connected devices, status, and one-click **Mount**, **Unmount** and **Open** actions.
+- **Automatic mounting.** Plug a phone in and its drive appears; unplug it and the drive is removed cleanly.
+- **Wide device support.** The embedded daemon is built for both `arm64-v8a` and `armeabi-v7a`, and the right one is chosen from the phone's CPU.
+- **Full read/write access.** Create, copy, rename, move and delete files and folders; large writes are streamed in chunks and failures are reported instead of dropping the drive.
+- **Built-in log viewer** and a log file for troubleshooting.
+- **Start with Windows**, minimized, from the Settings tab or the installer.
+- **Single self-contained installer** that also installs Dokan.
 
-Спочатку збирається `androidfs_server` під `aarch64-linux-android`: драйвер вбудовує цей бінарник через `include_bytes!` і сам заливає його в `/data/local/tmp` при підключенні.
+## Requirements
 
-Перевірка логіки демона без телефону і без Windows:
+| Component | Requirement |
+|-----------|-------------|
+| Windows | 10 or 11, 64-bit |
+| Driver | [Dokan 1.5.x](https://github.com/dokan-dev/dokany/releases/tag/v1.5.1.1000) (installed by the installer) |
+| ADB | `adb.exe` from [Android platform-tools](https://developer.android.com/tools/releases/platform-tools), on `PATH` or set in Settings |
+| Phone | Android with **USB debugging** enabled, `arm64-v8a` or `armeabi-v7a` |
+| Graphics | OpenGL 2.0 capable GPU or driver (required by the window) |
+
+## Installation
+
+1. Download `androidfs_f_installer.exe` from the latest successful run on the [Actions](https://github.com/AmakerGame/AndroidFS-F/actions) page (artifact **installer**).
+2. Run the installer and choose whether to start with Windows. Restart if asked, so that the Dokan driver loads.
+3. Make sure `adb.exe` is available (see Requirements).
+
+A portable `androidfs_driver.exe` is published as the **standalone** artifact. It still needs Dokan installed.
+
+## Usage
+
+1. On the phone: open *Settings > About phone*, tap *Build number* seven times, then enable *USB debugging* in *Developer options*.
+2. Connect the phone by USB and allow the computer on the phone screen.
+3. Start **AndroidFS-F**. The phone appears on the **Devices** tab and is mounted automatically as the first free drive letter, starting at `Q:`.
+4. Use **Open** to browse the drive in Explorer, and **Unmount** before unplugging when you want to be safe.
+
+Closing the window unmounts all drives and exits the application.
+
+## Configuration
+
+Settings are available on the **Settings** tab and are stored in `%APPDATA%\AndroidFS-F\settings.ini`.
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| Mount automatically | Mount devices as soon as they are detected | On |
+| Start with Windows | Launch minimized at sign-in | Off |
+| ADB path | Full path to `adb.exe` | Auto-detect |
+| Drive root | Android directory shown as the drive | `/storage/emulated/0` |
+
+Auto-detection of `adb.exe` checks `ANDROIDFS_ADB`, `ANDROID_HOME`, `ANDROID_SDK_ROOT`, `%LOCALAPPDATA%\Android\Sdk\platform-tools` and `PATH`. The `ANDROIDFS_ROOT` environment variable is still honoured when no drive root is set in the application.
+
+Command-line options for `androidfs_driver.exe`:
+
+| Option | Effect |
+|--------|--------|
+| `--background` | Start minimized (used by autostart) |
+
+## Building from source
+
+Prerequisites: stable Rust, [cargo-ndk](https://github.com/bbqsrc/cargo-ndk), the Android NDK (`ANDROID_NDK_HOME` set), Dokan 1.5.x with its development files, and the Windows SDK.
+
+```powershell
+rustup target add aarch64-linux-android armv7-linux-androideabi
+cargo install cargo-ndk
+./build.ps1
+```
+
+The script first builds the Android daemon for both ABIs, then builds the Windows application that embeds them with `include_bytes!`. The result is `target/release/androidfs_driver.exe`.
+
+The daemon logic and the wire protocol can be tested without a phone or Windows:
 
 ```
-cargo test
+cargo test --lib
 ```
 
-## Використання
+Continuous integration (`.github/workflows/installer.yml`) runs these tests on Linux, builds both daemons, builds the Windows application and compiles the installer with Inno Setup.
 
-1. На телефоні: сім разів номер збірки, у параметрах розробника увімкнути налагодження USB.
-2. Дозволити ключ комп’ютера на екрані телефону.
-3. Запустити `androidfs_driver.exe` (інсталятор додає його в автозавантаження).
-4. Диск з’явиться на першій вільній літері, починаючи з `Q:`.
+## How it works
 
-Потрібні platform-tools (`adb.exe`) в `PATH` або `ANDROIDFS_ADB`.
+```
+ Windows                                        Android
+┌──────────────────────────┐                  ┌───────────────────┐
+│ Explorer / any program   │                  │ androidfs_server  │
+│          │               │   adb forward    │ (arm64 or armv7)  │
+│  Dokan drive (Q:)        │◄────────────────►│ file operations   │
+│          │               │   TCP over USB   │ on shared storage │
+│  androidfs_driver.exe    │                  └───────────────────┘
+└──────────────────────────┘
+```
 
-Це досі альфа: швидкість обмежена USB-налагодженням, а права — користувачем `shell`, від якого запускається демон.
+On connection the application pushes the matching daemon to `/data/local/tmp`, starts it as the `shell` user, forwards a local TCP port to it through ADB, and serves Dokan file system calls by exchanging length-prefixed `bincode` messages with the daemon.
 
-## Ліцензія
+## Troubleshooting
 
-GNU GPL v3. Форк оригінального AndroidFS від Lauriethefish. Повний текст у `LICENSE`.
+| Symptom | Fix |
+|---------|-----|
+| "ADB is not available" | Install platform-tools and add `adb.exe` to `PATH`, or set its path in Settings |
+| Phone not listed | Enable USB debugging, reconnect the cable and accept the key prompt on the phone |
+| Status *Failed* with a Dokan message | Install Dokan 1.5.x and restart Windows |
+| Window does not open | Update the graphics driver; the window needs OpenGL 2.0 |
+| "Already running" message | Another instance is open; find it in the taskbar |
+
+Open the **Log** tab, or `%APPDATA%\AndroidFS-F\androidfs.log`, for details.
+
+## Limitations
+
+- Throughput is bounded by USB debugging, and file access rights are those of the `shell` user.
+- Only `arm64-v8a` and `armeabi-v7a` phones are supported.
+- File security descriptors and alternate data streams are not supported.
+
+## Changelog
+
+**0.3.0**
+
+- New desktop window with device list, mount / unmount / open actions, settings and log viewer.
+- Support for `armeabi-v7a` (32-bit ARM) phones next to `arm64-v8a`.
+- Application icon, English documentation, installer options for autostart and a desktop shortcut.
+- Settings and log moved to `%APPDATA%\AndroidFS-F`.
+
+**0.2.1**
+
+- Fixed the Windows build (daemon modules are Unix-only) and the GitHub Actions pipeline.
+- Write failures such as a full disk are reported to Windows instead of dropping the connection.
+- Symbolic links to directories are shown as directories.
+
+**0.2.0**
+
+- Implemented file and folder creation, writing, truncating and safe deletion in the daemon.
+- Fixed a panic on reads past the end of a file and wrong status codes for missing files.
+- The drive root is the phone's shared storage; ADB failures no longer stop the application.
+
+## License
+
+Released under the GNU General Public License v3.0. See [LICENSE](LICENSE). Based on [AndroidFS](https://github.com/Lauriethefish/AndroidFS) by Lauriethefish; the original readme is kept in [READMEoriginal.md](READMEoriginal.md).

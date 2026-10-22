@@ -20,7 +20,11 @@ mod client;
 #[cfg(windows)]
 mod file_system;
 #[cfg(windows)]
+mod gui;
+#[cfg(windows)]
 mod service;
+#[cfg(windows)]
+mod settings;
 
 pub fn server_main() {
     #[cfg(unix)]
@@ -37,7 +41,7 @@ pub fn server_main() {
 pub fn driver_main() {
     #[cfg(windows)]
     {
-        service::run();
+        gui::run();
     }
     #[cfg(not(windows))]
     {

@@ -26,10 +26,10 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Install Rust stable + Android target
+    - name: Install Rust stable + Android targets
       uses: dtolnay/rust-toolchain@stable
       with:
-        targets: aarch64-linux-android
+        targets: aarch64-linux-android,armv7-linux-androideabi
 
     - name: Cache Rust build
       uses: Swatinem/rust-cache@v2
@@ -75,18 +75,19 @@ jobs:
       with:
         tool: cargo-ndk
 
-    - name: Build Android server (arm64-v8a)
+    - name: Build Android server (arm64-v8a, armeabi-v7a)
       env:
         ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-      run: cargo ndk -t arm64-v8a build --release --bin androidfs_server
+      run: cargo ndk -t arm64-v8a -t armeabi-v7a build --release --bin androidfs_server
 
-    - name: Verify server binary exists
+    - name: Verify server binaries exist
       shell: pwsh
       run: |
-        $path = "target/aarch64-linux-android/release/androidfs_server"
-        if (-not (Test-Path $path)) {
-          Write-Host "::error::$path not found"
-          exit 1
+        foreach ($path in @("target/aarch64-linux-android/release/androidfs_server", "target/armv7-linux-androideabi/release/androidfs_server")) {
+          if (-not (Test-Path $path)) {
+            Write-Host "::error::$path not found"
+            exit 1
+          }
         }
 
     - name: Build Windows driver

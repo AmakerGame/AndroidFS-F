@@ -1,50 +1,144 @@
-use std::collections::{HashMap, HashSet};
+//! Background engine: finds Android devices through ADB, pushes the daemon,
+//! mounts / unmounts Dokan drives and publishes the state the GUI shows.
+
+use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use dokan::{Drive, MountFlags};
-use log::*;
+use log::{debug, error, info, warn};
 use widestring::U16CString;
+use winapi::um::minwinbase::SYSTEMTIME;
+use winapi::um::sysinfoapi::GetLocalTime;
 
 use crate::adb::{self, Invokeable};
 use crate::client::Client;
 use crate::file_system::QuestFsHandler;
+use crate::settings::Settings;
 
 const BASE_PORT: u16 = 15000;
 const MAX_PORT: u16 = 16000;
 const SERVER_PUSH_PATH: &str = "/data/local/tmp/androidfs_server";
-const SERVER_EXECUTABLE: &[u8] =
+const LOG_CAP: usize = 500;
+const POLL_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// 64-bit ARM daemon (arm64-v8a).
+const SERVER_ARM64: &[u8] =
     include_bytes!("../target/aarch64-linux-android/release/androidfs_server");
+/// 32-bit ARM daemon (armeabi-v7a).
+const SERVER_ARM32: &[u8] =
+    include_bytes!("../target/armv7-linux-androideabi/release/androidfs_server");
 
 const MOUNT_POINTS: &[&str] = &[
     "Q:", "R:", "S:", "T:", "U:", "V:", "W:", "X:", "Y:", "Z:", "D:", "E:", "F:", "G:", "H:", "I:",
     "J:", "K:", "L:", "M:", "N:", "O:", "P:",
 ];
 
-struct MountTable {
-    mounted: HashMap<String, String>,
-    reserved: HashSet<String>,
-    retry_after: HashMap<String, Instant>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceState {
+    Detected,
+    Mounting,
+    Mounted(String),
+    Unmounting,
+    Failed(String),
 }
 
-impl MountTable {
-    fn new() -> Self {
-        MountTable {
-            mounted: HashMap::new(),
+#[derive(Clone, Debug)]
+pub struct DeviceEntry {
+    pub serial: String,
+    pub model: String,
+    pub abi: String,
+    pub state: DeviceState,
+    /// Set when the user unmounted the device: no automatic remount until "Mount" is pressed.
+    pub manual_hold: bool,
+    pub retry_after: Option<Instant>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Command {
+    Refresh,
+    Mount(String),
+    Unmount(String),
+}
+
+pub struct Shared {
+    pub devices: Vec<DeviceEntry>,
+    pub settings: Settings,
+    pub log: VecDeque<String>,
+    pub adb_path_in_use: String,
+    pub adb_error: Option<String>,
+    pub commands: VecDeque<Command>,
+    reserved: HashSet<String>,
+    pub quit: bool,
+}
+
+pub type SharedState = Arc<Mutex<Shared>>;
+
+pub fn lock(shared: &SharedState) -> MutexGuard<'_, Shared> {
+    shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Shared {
+    pub fn new(settings: Settings) -> Self {
+        Shared {
+            devices: Vec::new(),
+            settings,
+            log: VecDeque::new(),
+            adb_path_in_use: String::new(),
+            adb_error: None,
+            commands: VecDeque::new(),
             reserved: HashSet::new(),
-            retry_after: HashMap::new(),
+            quit: false,
         }
     }
 
-    fn pick_letter(&self) -> Option<&'static str> {
-        MOUNT_POINTS.iter().copied().find(|letter| {
-            !self.reserved.contains(*letter)
-                && !Path::new(&format!("{letter}\\")).exists()
-        })
+    pub fn push_log(&mut self, line: String) {
+        if self.log.len() >= LOG_CAP {
+            self.log.pop_front();
+        }
+        self.log.push_back(format!("[{}] {}", timestamp(), line));
     }
+
+    fn entry_mut(&mut self, serial: &str) -> Option<&mut DeviceEntry> {
+        self.devices.iter_mut().find(|device| device.serial == serial)
+    }
+}
+
+fn timestamp() -> String {
+    unsafe {
+        let mut st: SYSTEMTIME = std::mem::zeroed();
+        GetLocalTime(&mut st);
+        format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
+    }
+}
+
+fn ui_info(shared: &SharedState, msg: String) {
+    info!("{msg}");
+    lock(shared).push_log(msg);
+}
+
+fn ui_error(shared: &SharedState, msg: String) {
+    error!("{msg}");
+    lock(shared).push_log(format!("ERROR: {msg}"));
+}
+
+fn server_binary_for(abi: &str) -> Option<&'static [u8]> {
+    if abi.starts_with("arm64") {
+        Some(SERVER_ARM64)
+    } else if abi.starts_with("armeabi") {
+        Some(SERVER_ARM32)
+    } else {
+        None
+    }
+}
+
+fn pick_letter(reserved: &HashSet<String>) -> Option<&'static str> {
+    MOUNT_POINTS.iter().copied().find(|letter| {
+        !reserved.contains(*letter) && !Path::new(&format!("{letter}\\")).exists()
+    })
 }
 
 enum SetupError {
@@ -72,7 +166,9 @@ impl std::fmt::Display for SetupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SetupError::Adb(err) => write!(f, "{err}"),
-            SetupError::NoAvailablePort => write!(f, "no free TCP port between {BASE_PORT} and {MAX_PORT}"),
+            SetupError::NoAvailablePort => {
+                write!(f, "no free TCP port between {BASE_PORT} and {MAX_PORT}")
+            }
             SetupError::NoAvailableDriveLetter => write!(f, "no free drive letter"),
             SetupError::DaemonUnreachable => {
                 write!(f, "the on-device daemon did not accept a connection")
@@ -80,13 +176,13 @@ impl std::fmt::Display for SetupError {
             SetupError::Io(err) => write!(f, "could not stage the daemon binary: {err}"),
             SetupError::UnsupportedAbi(abi) => write!(
                 f,
-                "device CPU ABI is {abi}; this build only includes the arm64 daemon"
+                "device CPU ABI is {abi}; supported ABIs are arm64-v8a and armeabi-v7a"
             ),
         }
     }
 }
 
-fn is_safe_android_path(path: &str) -> bool {
+pub fn is_safe_android_path(path: &str) -> bool {
     let path = path.trim();
     path.starts_with('/')
         && path.len() < 240
@@ -99,36 +195,51 @@ fn shell(device: &adb::Device, script: &str) -> Result<std::process::Output, adb
     device.invoke_shell_command_result(vec![script.to_string()])
 }
 
-fn setup(device: adb::Device, table: Arc<Mutex<MountTable>>) -> Result<String, SetupError> {
-    info!("Mounting {}", device.serial_number);
+fn getprop(device: &adb::Device, key: &str) -> String {
+    shell(device, &format!("getprop {key}"))
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default()
+}
 
-    let abi = String::from_utf8_lossy(
-        &shell(&device, "getprop ro.product.cpu.abi")?.stdout,
-    )
-    .trim()
-    .to_string();
-    if !abi.is_empty() && !abi.starts_with("arm64") {
-        return Err(SetupError::UnsupportedAbi(abi));
+fn setup(device: adb::Device, shared: &SharedState) -> Result<String, SetupError> {
+    let serial = device.serial_number.clone();
+    ui_info(shared, format!("Mounting {serial}"));
+
+    let abi = String::from_utf8_lossy(&shell(&device, "getprop ro.product.cpu.abi")?.stdout)
+        .trim()
+        .to_string();
+    let binary: &'static [u8] = if abi.is_empty() {
+        SERVER_ARM64
+    } else {
+        server_binary_for(&abi).ok_or_else(|| SetupError::UnsupportedAbi(abi.clone()))?
+    };
+    {
+        let mut guard = lock(shared);
+        if let Some(entry) = guard.entry_mut(&serial) {
+            entry.abi = abi.clone();
+        }
     }
 
-    let letter = {
-        let mut guard = table.lock().unwrap();
-        let letter = guard.pick_letter().ok_or(SetupError::NoAvailableDriveLetter)?;
+    let (letter, root) = {
+        let mut guard = lock(shared);
+        let letter = pick_letter(&guard.reserved).ok_or(SetupError::NoAvailableDriveLetter)?;
         guard.reserved.insert(letter.to_string());
-        letter.to_string()
+        (letter.to_string(), guard.settings.root.clone())
     };
 
-    let result = setup_reserved(device, table.clone(), &letter);
+    let result = setup_reserved(device, shared, &letter, binary, &root);
     if result.is_err() {
-        table.lock().unwrap().reserved.remove(&letter);
+        lock(shared).reserved.remove(&letter);
     }
     result
 }
 
 fn setup_reserved(
     device: adb::Device,
-    table: Arc<Mutex<MountTable>>,
+    shared: &SharedState,
     letter: &str,
+    binary: &'static [u8],
+    root_setting: &str,
 ) -> Result<String, SetupError> {
     let mut chosen_port = None;
     for port in BASE_PORT..=MAX_PORT {
@@ -156,15 +267,12 @@ fn setup_reserved(
     };
 
     if let Err(err) = (|| -> Result<(), SetupError> {
-        let _ = shell(
-            &device,
-            "killall androidfs_server >/dev/null 2>&1 || true",
-        );
+        let _ = shell(&device, "killall androidfs_server >/dev/null 2>&1 || true");
         std::thread::sleep(Duration::from_millis(200));
         let _ = shell(&device, "rm -f /data/local/tmp/androidfs_server");
 
         let mut staged = tempfile::NamedTempFile::new()?;
-        staged.write_all(SERVER_EXECUTABLE)?;
+        staged.write_all(binary)?;
         staged.flush()?;
         let staged_path = staged
             .path()
@@ -185,20 +293,26 @@ fn setup_reserved(
         return Err(err);
     }
 
+    let root = if root_setting.trim().is_empty() {
+        std::env::var("ANDROIDFS_ROOT").unwrap_or_default()
+    } else {
+        root_setting.to_string()
+    };
+
     let serial = device.serial_number.clone();
     let letter_owned = letter.to_string();
     let device_for_daemon = device.clone();
-    let table_for_daemon = table.clone();
+    let shared_for_daemon = shared.clone();
     std::thread::spawn(move || {
         debug!("Starting on-device daemon for {serial}");
         let mut command = String::from("/data/local/tmp/androidfs_server");
-        if let Ok(root) = std::env::var("ANDROIDFS_ROOT") {
+        if !root.trim().is_empty() {
             if is_safe_android_path(&root) {
                 command.push(' ');
                 command.push_str(root.trim());
-                info!("{serial}: using ANDROIDFS_ROOT {}", root.trim());
+                info!("{serial}: using root {}", root.trim());
             } else {
-                warn!("{serial}: ignoring unsafe ANDROIDFS_ROOT {root:?}");
+                warn!("{serial}: ignoring unsafe root {root:?}");
             }
         }
         let run = shell(&device_for_daemon, &command);
@@ -207,9 +321,14 @@ fn setup_reserved(
         } else {
             info!("Daemon for {serial} exited");
         }
-        let guard = table_for_daemon.lock().unwrap();
-        if guard.mounted.contains_key(&serial) {
-            drop(guard);
+        let still_mounted = {
+            let guard = lock(&shared_for_daemon);
+            guard.devices.iter().any(|device| {
+                device.serial == serial
+                    && matches!(&device.state, DeviceState::Mounted(l) if *l == letter_owned)
+            })
+        };
+        if still_mounted {
             if !dokan::unmount(U16CString::from_str(&letter_owned).unwrap()) {
                 warn!("Failed to unmount {letter_owned} for {serial}");
             }
@@ -231,17 +350,19 @@ fn setup_reserved(
         U16CString::from_str(&label).unwrap_or_else(|_| U16CString::from_str("Android").unwrap());
     let mount_point = U16CString::from_str(letter).unwrap();
     let serial = device.serial_number.clone();
-    let table_for_mount = table.clone();
+    let letter_for_mount = letter.to_string();
+    let shared_for_mount = shared.clone();
     let device_for_cleanup = device.clone();
     {
-        let mut guard = table.lock().unwrap();
-        guard
-            .mounted
-            .insert(device.serial_number.clone(), letter.to_string());
-        guard.retry_after.remove(&device.serial_number);
+        let mut guard = lock(shared);
+        if let Some(entry) = guard.entry_mut(&device.serial_number) {
+            entry.state = DeviceState::Mounted(letter.to_string());
+            entry.retry_after = None;
+        }
     }
     std::thread::spawn(move || {
         let handler = QuestFsHandler::new(Client::new(stream), volume_name);
+        let mut failure: Option<String> = None;
         match Drive::new()
             .mount_point(&mount_point)
             .flags(MountFlags::CASE_SENSITIVE)
@@ -249,21 +370,38 @@ fn setup_reserved(
             .mount(&handler)
         {
             Ok(_) => debug!("Mount thread for {serial} exited"),
-            Err(err) => error!("Mount error for {serial}: {err}"),
+            Err(err) => {
+                error!("Mount error for {serial}: {err}");
+                failure = Some(format!("Dokan could not mount the drive: {err}. Is Dokan 1.5 installed?"));
+            }
         }
         let _ = device_for_cleanup.invoke_result(vec![
             "forward".to_string(),
             "--remove".to_string(),
             format!("tcp:{port}"),
         ]);
-        let mut guard = table_for_mount.lock().unwrap();
-        if let Some(used) = guard.mounted.remove(&serial) {
-            guard.reserved.remove(&used);
+        {
+            let mut guard = lock(&shared_for_mount);
+            guard.reserved.remove(&letter_for_mount);
+            if let Some(entry) = guard.entry_mut(&serial) {
+                match &failure {
+                    Some(msg) => {
+                        entry.state = DeviceState::Failed(msg.clone());
+                        entry.retry_after = Some(Instant::now() + Duration::from_secs(15));
+                    }
+                    None => {
+                        entry.state = DeviceState::Detected;
+                        if !entry.manual_hold {
+                            entry.retry_after = Some(Instant::now() + Duration::from_secs(5));
+                        }
+                    }
+                }
+            }
         }
-        // Avoid a tight push/mount loop if the mount keeps failing.
-        guard
-            .retry_after
-            .insert(serial.clone(), Instant::now() + Duration::from_secs(5));
+        match failure {
+            Some(msg) => ui_error(&shared_for_mount, format!("{serial}: {msg}")),
+            None => ui_info(&shared_for_mount, format!("{serial} unmounted")),
+        }
     });
 
     Ok(letter.to_string())
@@ -298,83 +436,246 @@ fn connect_with_retry(port: u16) -> std::io::Result<TcpStream> {
     }))
 }
 
-fn init_logging(console: bool) {
-    let mut builder = env_logger::Builder::new();
-    builder.parse_default_env();
-    if std::env::var_os("RUST_LOG").is_none() {
-        builder.filter_level(LevelFilter::Info);
-    }
-    if console {
-        builder.init();
-        return;
-    }
-    let path = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("androidfs.log")))
-        .unwrap_or_else(|| std::path::PathBuf::from("androidfs.log"));
-    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        Ok(file) => {
-            builder.target(env_logger::Target::Pipe(Box::new(file))).init();
+fn mount_now(shared: &SharedState, bridge: &adb::DebugBridge, serial: &str) {
+    {
+        let mut guard = lock(shared);
+        let Some(entry) = guard.entry_mut(serial) else {
+            return;
+        };
+        if matches!(
+            entry.state,
+            DeviceState::Mounted(_) | DeviceState::Mounting | DeviceState::Unmounting
+        ) {
+            return;
         }
-        Err(_) => {
-            builder.init();
+        entry.state = DeviceState::Mounting;
+        entry.manual_hold = false;
+    }
+    match setup(bridge.device(serial), shared) {
+        Ok(drive) => ui_info(shared, format!("Mounted {serial} as {drive}\\")),
+        Err(err) => {
+            let wait = match err {
+                SetupError::UnsupportedAbi(_) => 3600,
+                _ => 15,
+            };
+            {
+                let mut guard = lock(shared);
+                if let Some(entry) = guard.entry_mut(serial) {
+                    entry.state = DeviceState::Failed(err.to_string());
+                    entry.retry_after = Some(Instant::now() + Duration::from_secs(wait));
+                }
+            }
+            ui_error(shared, format!("Failed to mount {serial}: {err}"));
         }
     }
 }
 
-pub fn run() {
-    let console = std::env::var("ANDROIDFS_CONSOLE").is_ok();
-    if !console {
-        unsafe {
-            winapi::um::wincon::FreeConsole();
+fn unmount_one(shared: &SharedState, serial: &str) {
+    let letter = {
+        let mut guard = lock(shared);
+        match guard.entry_mut(serial) {
+            Some(entry) => {
+                entry.manual_hold = true;
+                let current = entry.state.clone();
+                if let DeviceState::Mounted(letter) = current {
+                    entry.state = DeviceState::Unmounting;
+                    Some(letter)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    };
+    if let Some(letter) = letter {
+        ui_info(shared, format!("Unmounting {letter}"));
+        if !dokan::unmount(U16CString::from_str(&letter).unwrap()) {
+            {
+                let mut guard = lock(shared);
+                if let Some(entry) = guard.entry_mut(serial) {
+                    entry.state = DeviceState::Mounted(letter.clone());
+                    entry.manual_hold = false;
+                }
+            }
+            ui_error(shared, format!("Could not unmount {letter}; close programs using the drive and retry"));
         }
     }
-    init_logging(console);
-    info!("AndroidFS-F {} started", env!("CARGO_PKG_VERSION"));
+}
 
-    let adb = adb::DebugBridge::locate();
-    info!("Using adb at {}", adb.adb_path);
-    let table = Arc::new(Mutex::new(MountTable::new()));
-
-    loop {
-        match adb.get_devices() {
-            Ok(devices) => {
-                let due: Vec<adb::Device> = {
-                    let guard = table.lock().unwrap();
-                    devices
-                        .into_iter()
-                        .filter(|device| {
-                            if guard.mounted.contains_key(&device.serial_number) {
-                                return false;
-                            }
-                            match guard.retry_after.get(&device.serial_number) {
-                                Some(when) => Instant::now() >= *when,
-                                None => true,
-                            }
-                        })
-                        .collect()
-                };
-                for device in due {
-                    let serial = device.serial_number.clone();
-                    match setup(device, table.clone()) {
-                        Ok(drive) => info!("Mounted {serial} as {drive}"),
-                        Err(err) => {
-                            error!("Failed to mount {serial}: {err}");
-                            let mut guard = table.lock().unwrap();
-                            let fails = guard.retry_after.contains_key(&serial);
-                            let wait = if fails { 15 } else { 5 };
-                            guard
-                                .retry_after
-                                .insert(serial, Instant::now() + Duration::from_secs(wait));
-                        }
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(750));
+fn poll_devices(shared: &SharedState, bridge: &adb::DebugBridge) {
+    let devices = match bridge.get_devices() {
+        Ok(devices) => devices,
+        Err(err) => {
+            let message = err.to_string();
+            let changed = {
+                let mut guard = lock(shared);
+                let changed = guard.adb_error.as_deref() != Some(message.as_str());
+                guard.adb_error = Some(message.clone());
+                changed
+            };
+            if changed {
+                ui_error(shared, format!("ADB: {message}"));
             }
-            Err(err) => {
-                error!("{err}");
-                std::thread::sleep(Duration::from_secs(3));
+            return;
+        }
+    };
+    let serials: Vec<String> = devices.into_iter().map(|d| d.serial_number).collect();
+    {
+        let mut guard = lock(shared);
+        guard.adb_error = None;
+        guard.devices.retain(|d| {
+            serials.contains(&d.serial)
+                || matches!(
+                    d.state,
+                    DeviceState::Mounted(_) | DeviceState::Mounting | DeviceState::Unmounting
+                )
+        });
+        for serial in &serials {
+            if !guard.devices.iter().any(|d| d.serial == *serial) {
+                guard.devices.push(DeviceEntry {
+                    serial: serial.clone(),
+                    model: String::new(),
+                    abi: String::new(),
+                    state: DeviceState::Detected,
+                    manual_hold: false,
+                    retry_after: None,
+                });
+                guard.push_log(format!("Device detected: {serial}"));
             }
         }
+    }
+
+    let missing: Vec<String> = {
+        let guard = lock(shared);
+        guard
+            .devices
+            .iter()
+            .filter(|d| d.model.is_empty())
+            .map(|d| d.serial.clone())
+            .collect()
+    };
+    for serial in missing {
+        let device = bridge.device(&serial);
+        let model = getprop(&device, "ro.product.model");
+        let maker = getprop(&device, "ro.product.manufacturer");
+        let abi = getprop(&device, "ro.product.cpu.abi");
+        let name = if model.is_empty() {
+            maker
+        } else if maker.is_empty() || model.to_lowercase().starts_with(&maker.to_lowercase()) {
+            model
+        } else {
+            format!("{maker} {model}")
+        };
+        let mut guard = lock(shared);
+        if let Some(entry) = guard.entry_mut(&serial) {
+            entry.model = if name.is_empty() {
+                "Android device".to_string()
+            } else {
+                name
+            };
+            if entry.abi.is_empty() {
+                entry.abi = abi;
+            }
+        }
+    }
+
+    let now = Instant::now();
+    let (auto_mount, candidates): (bool, Vec<String>) = {
+        let guard = lock(shared);
+        (
+            guard.settings.auto_mount,
+            guard
+                .devices
+                .iter()
+                .filter(|d| {
+                    matches!(d.state, DeviceState::Detected | DeviceState::Failed(_))
+                        && !d.manual_hold
+                        && d.retry_after.map_or(true, |t| now >= t)
+                })
+                .map(|d| d.serial.clone())
+                .collect(),
+        )
+    };
+    if auto_mount {
+        for serial in candidates {
+            mount_now(shared, bridge, &serial);
+        }
+    }
+}
+
+pub fn spawn_engine(shared: SharedState) {
+    std::thread::spawn(move || engine_loop(shared));
+}
+
+fn engine_loop(shared: SharedState) {
+    let mut adb_key = lock(&shared).settings.adb_path.clone();
+    let mut bridge = adb::DebugBridge::locate_with(&adb_key);
+    lock(&shared).adb_path_in_use = bridge.adb_path.clone();
+    ui_info(&shared, format!("Using adb at {}", bridge.adb_path));
+
+    let mut last_poll = Instant::now() - Duration::from_secs(60);
+    let mut force_poll = true;
+    loop {
+        let (quit, adb_wanted) = {
+            let guard = lock(&shared);
+            (guard.quit, guard.settings.adb_path.clone())
+        };
+        if quit {
+            return;
+        }
+        if adb_wanted != adb_key {
+            adb_key = adb_wanted;
+            bridge = adb::DebugBridge::locate_with(&adb_key);
+            lock(&shared).adb_path_in_use = bridge.adb_path.clone();
+            ui_info(&shared, format!("Using adb at {}", bridge.adb_path));
+            force_poll = true;
+        }
+
+        let commands: Vec<Command> = lock(&shared).commands.drain(..).collect();
+        for command in commands {
+            match command {
+                Command::Refresh => force_poll = true,
+                Command::Mount(serial) => mount_now(&shared, &bridge, &serial),
+                Command::Unmount(serial) => unmount_one(&shared, &serial),
+            }
+        }
+
+        if force_poll || last_poll.elapsed() >= POLL_INTERVAL {
+            force_poll = false;
+            last_poll = Instant::now();
+            poll_devices(&shared, &bridge);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Unmounts every drive and stops the engine. Called when the window closes.
+pub fn shutdown(shared: &SharedState) {
+    let letters: Vec<String> = {
+        let mut guard = lock(shared);
+        guard.quit = true;
+        guard
+            .devices
+            .iter()
+            .filter_map(|d| match &d.state {
+                DeviceState::Mounted(letter) => Some(letter.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    for letter in letters {
+        let _ = dokan::unmount(U16CString::from_str(&letter).unwrap());
+    }
+    for _ in 0..40 {
+        let busy = lock(shared).devices.iter().any(|d| {
+            matches!(
+                d.state,
+                DeviceState::Mounted(_) | DeviceState::Unmounting | DeviceState::Mounting
+            )
+        });
+        if !busy {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }

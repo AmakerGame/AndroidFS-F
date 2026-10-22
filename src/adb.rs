@@ -73,9 +73,22 @@ impl Invokeable for Device {
 }
 
 impl DebugBridge {
+    #[allow(dead_code)]
     pub fn locate() -> Self {
+        Self::locate_with("")
+    }
+
+    /// `custom` is a user-chosen adb path; empty means auto-detect.
+    pub fn locate_with(custom: &str) -> Self {
         DebugBridge {
-            adb_path: locate_adb_path(),
+            adb_path: locate_adb_path(custom),
+        }
+    }
+
+    pub fn device(&self, serial: &str) -> Device {
+        Device {
+            debug_bridge: self.clone(),
+            serial_number: serial.to_string(),
         }
     }
 
@@ -112,7 +125,10 @@ impl Invokeable for DebugBridge {
     }
 }
 
-fn locate_adb_path() -> String {
+fn locate_adb_path(custom: &str) -> String {
+    if !custom.trim().is_empty() {
+        return custom.trim().to_string();
+    }
     if let Some(explicit) = std::env::var_os("ANDROIDFS_ADB") {
         return PathBuf::from(explicit).to_string_lossy().into_owned();
     }

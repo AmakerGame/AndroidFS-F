@@ -1,12 +1,13 @@
 AndroidFS-F is installed.
 
-Plug in an Android phone with USB debugging allowed. It is mounted automatically
-as the first free drive letter, starting at Q:.
+Start AndroidFS-F from the Start menu. In the window, plug in an Android phone
+with USB debugging enabled and allow this computer on the phone screen. The phone
+appears in the device list and is mounted as the first free drive letter,
+starting at Q:.
 
-The mounted root is the phone's shared storage (/storage/emulated/0), not the
-raw system root. Set ANDROIDFS_ROOT to another absolute path before starting
-the driver if you need a different tree.
+Supported phones: arm64-v8a and armeabi-v7a.
 
-If a device does not appear, set ANDROIDFS_CONSOLE=1 and RUST_LOG=info, restart,
-and read androidfs.log next to androidfs_driver.exe. adb.exe must be on PATH
-or pointed to by ANDROIDFS_ADB.
+Settings and the log are stored in %APPDATA%\AndroidFS-F. adb.exe must be on
+PATH, or set its location in Settings.
+
+A restart may be required for the Dokan driver to load.

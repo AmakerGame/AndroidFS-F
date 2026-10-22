@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "androidfs_driver"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bincode",
  "byteorder",
