@@ -92,7 +92,7 @@ Settings > *Access on the phone*:
 | Without root | Never uses `su`. Works on every phone, limited to what `shell` may read (shared storage, `/storage`, most of `/`). |
 | Root (su) | Always starts through `su` (Magisk, SuperSU, KernelSU, `su 0`, `su root`; also phones where adbd already runs as root). Needed for `/data`. Approve the request on the phone. |
 
-The device list shows the mode in use and the folder that is mounted. Quick buttons next to *Drive root* select shared storage, `/`, `/storage` or `/data`.
+Each device in the **Devices** tab has its own *Access for this device* section (mode and folder), stored per serial; it overrides the global setting. With root and no folder chosen, the whole device (`/`) is shown instead of only shared storage. The device list shows the mode in use and the folder that is mounted. Quick buttons next to *Drive root* select shared storage, `/`, `/storage` or `/data`.
 
 ## Building from source
 

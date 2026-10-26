@@ -351,7 +351,14 @@ fn start_daemon(
     std::thread::sleep(Duration::from_millis(250));
 
     let root_arg = if root_setting.trim().is_empty() {
-        None
+        // Root can read everything, so showing only /sdcard would hide what the
+        // user got root for. Pick a folder per device in the device list to
+        // limit it again.
+        if access.is_root() {
+            Some("/")
+        } else {
+            None
+        }
     } else if is_safe_android_path(root_setting) {
         Some(root_setting.trim())
     } else {
@@ -550,11 +557,8 @@ fn setup(device: adb::Device, shared: &SharedState) -> Result<String, SetupError
         let mut guard = lock(shared);
         let letter = pick_letter(&guard.reserved).ok_or(SetupError::NoAvailableDriveLetter)?;
         guard.reserved.insert(letter.to_string());
-        (
-            letter.to_string(),
-            guard.settings.root.clone(),
-            guard.settings.access_mode,
-        )
+        let (mode, root) = guard.settings.effective(&serial);
+        (letter.to_string(), root, mode)
     };
 
     let result = setup_reserved(device, shared, &letter, binary, &root, mode);

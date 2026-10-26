@@ -10,7 +10,7 @@ use winapi::um::winuser::{MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB
 
 use crate::daemon_cmd::AccessMode;
 use crate::service::{self, Command, DeviceEntry, DeviceState, SharedState};
-use crate::settings::{self, Settings};
+use crate::settings::{self, DeviceSetting, Settings};
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(61, 220, 132);
 const WARN: egui::Color32 = egui::Color32::from_rgb(240, 180, 60);
@@ -71,6 +71,81 @@ impl App {
             Ok(()) => Some((true, "Settings saved.".to_string())),
             Err(err) => Some((false, format!("Could not save settings: {err}"))),
         };
+    }
+
+    /// Saves per-device overrides immediately (they apply at the next mount).
+    fn save_device_settings(&mut self) {
+        let mut applied = self.applied();
+        applied.per_device = self.form.per_device.clone();
+        service::lock(&self.shared).settings = applied.clone();
+        self.note = match settings::save(&applied) {
+            Ok(()) => None,
+            Err(err) => Some((false, format!("Could not save settings: {err}"))),
+        };
+    }
+
+    fn device_access_ui(&mut self, ui: &mut egui::Ui, serial: &str) {
+        let mut entry = self.form.per_device.get(serial).cloned().unwrap_or_default();
+        let before = entry.clone();
+        let default_label = match self.form.access_mode {
+            AccessMode::Auto => "Default (automatic)",
+            AccessMode::Shell => "Default (without root)",
+            AccessMode::Root => "Default (root)",
+        };
+        let current = match entry.access_mode {
+            None => default_label,
+            Some(AccessMode::Auto) => "Automatic",
+            Some(AccessMode::Shell) => "Without root",
+            Some(AccessMode::Root) => "Root (su)",
+        };
+        ui.collapsing("Access for this device", |ui| {
+            egui::ComboBox::from_id_source(format!("access_{serial}"))
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut entry.access_mode, None, default_label);
+                    ui.selectable_value(&mut entry.access_mode, Some(AccessMode::Auto), "Automatic");
+                    ui.selectable_value(&mut entry.access_mode, Some(AccessMode::Shell), "Without root");
+                    ui.selectable_value(&mut entry.access_mode, Some(AccessMode::Root), "Root (su)");
+                });
+            let mut root = entry.root.clone().unwrap_or_default();
+            ui.add(
+                egui::TextEdit::singleline(&mut root)
+                    .hint_text("Folder (empty = default)")
+                    .desired_width(220.0),
+            );
+            ui.horizontal(|ui| {
+                if ui.small_button("Default").clicked() {
+                    root.clear();
+                    entry.root = None;
+                }
+                if ui.small_button("Storage").clicked() {
+                    root = "/storage/emulated/0".to_string();
+                }
+                if ui.small_button("/").clicked() {
+                    root = "/".to_string();
+                }
+                if ui.small_button("/data").clicked() {
+                    root = "/data".to_string();
+                }
+            });
+            if !root.is_empty() || entry.root.is_some() {
+                entry.root = if root.is_empty() { None } else { Some(root) };
+            }
+            ui.label(
+                egui::RichText::new("Unmount and Mount again to apply. With root and no folder, the whole device (/) is shown.")
+                    .small()
+                    .color(MUTED),
+            );
+        });
+        let valid = entry.root.as_deref().map_or(true, |r| r.trim().is_empty() || service::is_safe_android_path(r));
+        if entry != before && valid {
+            if entry == DeviceSetting::default() {
+                self.form.per_device.remove(serial);
+            } else {
+                self.form.per_device.insert(serial.to_string(), entry);
+            }
+            self.save_device_settings();
+        }
     }
 
     fn devices_tab(&mut self, ui: &mut egui::Ui, devices: &[DeviceEntry], adb_error: &Option<String>) {
@@ -172,6 +247,7 @@ impl App {
                                     ui.label(egui::RichText::new(note.as_str()).small().color(WARN));
                                 }
                             }
+                            self.device_access_ui(ui, &device.serial);
                         });
                         ui.label(if device.abi.is_empty() { "-" } else { device.abi.as_str() });
                         state_label(ui, &device.state);
