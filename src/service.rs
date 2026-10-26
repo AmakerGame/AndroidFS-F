@@ -3,8 +3,9 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
-use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -16,12 +17,17 @@ use winapi::um::sysinfoapi::GetLocalTime;
 
 use crate::adb::{self, Invokeable};
 use crate::client::Client;
+use crate::daemon_cmd::{
+    self, Access, AccessMode, SuStyle, DAEMON_PORT, KILL_SCRIPT, SERVER_PATH, SU_STYLES,
+};
 use crate::file_system::QuestFsHandler;
+use crate::responses;
 use crate::settings::Settings;
+
+pub use crate::daemon_cmd::is_safe_android_path;
 
 const BASE_PORT: u16 = 15000;
 const MAX_PORT: u16 = 16000;
-const SERVER_PUSH_PATH: &str = "/data/local/tmp/androidfs_server";
 const LOG_CAP: usize = 500;
 const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
@@ -46,6 +52,17 @@ pub enum DeviceState {
     Failed(String),
 }
 
+/// What the daemon reported once the drive was mounted; shown in the device list.
+#[derive(Clone, Debug)]
+pub struct MountInfo {
+    /// "shell (no root)", "root (su -c)", ...
+    pub access: String,
+    /// Android folder that is shown as the drive.
+    pub root_dir: String,
+    pub entries: Option<u32>,
+    pub note: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct DeviceEntry {
     pub serial: String,
@@ -55,6 +72,9 @@ pub struct DeviceEntry {
     /// Set when the user unmounted the device: no automatic remount until "Mount" is pressed.
     pub manual_hold: bool,
     pub retry_after: Option<Instant>,
+    pub info: Option<MountInfo>,
+    /// The `su` flavour that worked on this device (remembered to clean up root daemons).
+    pub su_style: Option<SuStyle>,
 }
 
 #[derive(Clone, Debug)]
@@ -146,7 +166,11 @@ enum SetupError {
     NoAvailableDriveLetter,
     Adb(adb::Error),
     Io(std::io::Error),
-    DaemonUnreachable,
+    DaemonUnreachable(String),
+    DaemonExited(String),
+    StaleDaemon,
+    NoRoot,
+    MountFailed(String),
     UnsupportedAbi(String),
 }
 
@@ -170,9 +194,22 @@ impl std::fmt::Display for SetupError {
                 write!(f, "no free TCP port between {BASE_PORT} and {MAX_PORT}")
             }
             SetupError::NoAvailableDriveLetter => write!(f, "no free drive letter"),
-            SetupError::DaemonUnreachable => {
-                write!(f, "the on-device daemon did not accept a connection")
+            SetupError::DaemonUnreachable(detail) => write!(
+                f,
+                "the on-device daemon did not answer ({detail}). Check the log; the phone may block running files from /data/local/tmp"
+            ),
+            SetupError::DaemonExited(output) => {
+                write!(f, "the on-device daemon stopped right after starting: {output}")
             }
+            SetupError::StaleDaemon => write!(
+                f,
+                "an old androidfs_server (probably started as root) still holds the port on the phone; reboot the phone or stop it with: su -c killall androidfs_server"
+            ),
+            SetupError::NoRoot => write!(
+                f,
+                "root access mode is selected, but the device did not grant root (su). Approve the request on the phone or switch the access mode to Auto"
+            ),
+            SetupError::MountFailed(detail) => write!(f, "{detail}"),
             SetupError::Io(err) => write!(f, "could not stage the daemon binary: {err}"),
             SetupError::UnsupportedAbi(abi) => write!(
                 f,
@@ -180,15 +217,6 @@ impl std::fmt::Display for SetupError {
             ),
         }
     }
-}
-
-pub fn is_safe_android_path(path: &str) -> bool {
-    let path = path.trim();
-    path.starts_with('/')
-        && path.len() < 240
-        && path
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '.' | '-'))
 }
 
 fn shell(device: &adb::Device, script: &str) -> Result<std::process::Output, adb::Error> {
@@ -199,6 +227,304 @@ fn getprop(device: &adb::Device, key: &str) -> String {
     shell(device, &format!("getprop {key}"))
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .unwrap_or_default()
+}
+
+fn output_text(out: &std::process::Output) -> String {
+    let mut text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let err = err.trim();
+    if !err.is_empty() {
+        if !text.is_empty() {
+            text.push_str(" | ");
+        }
+        text.push_str(err);
+    }
+    if text.chars().count() > 600 {
+        text = text.chars().take(600).collect::<String>() + "...";
+    }
+    text
+}
+
+/// True when the ADB daemon on the device already runs as root (userdebug
+/// builds, `adb root`, many TV boxes), so no `su` is needed.
+fn shell_is_root(device: &adb::Device) -> bool {
+    shell(device, "id -u")
+        .ok()
+        .and_then(|out| daemon_cmd::parse_uid(&String::from_utf8_lossy(&out.stdout)))
+        == Some(0)
+}
+
+/// Finds out which `su` flavour (if any) gives a root shell. May block until
+/// the user approves the request on the phone, hence the timeout.
+fn probe_root(device: &adb::Device, shared: &SharedState) -> Option<SuStyle> {
+    let serial = device.serial_number.clone();
+    for style in SU_STYLES {
+        let script = daemon_cmd::wrap(Access::Root(style), "id -u");
+        match device.shell_timeout(&script, Duration::from_secs(15)) {
+            Ok(out) if out.status.success() => {
+                if daemon_cmd::parse_uid(&String::from_utf8_lossy(&out.stdout)) == Some(0) {
+                    ui_info(shared, format!("{serial}: root access granted ({})", style.label()));
+                    if let Some(entry) = lock(shared).entry_mut(&serial) {
+                        entry.su_style = Some(style);
+                    }
+                    return Some(style);
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                if matches!(err.kind, adb::ErrorKind::TimedOut) {
+                    ui_info(
+                        shared,
+                        format!("{serial}: su did not answer; approve the root request on the phone"),
+                    );
+                    return None;
+                }
+                debug!("{serial}: su probe ({}) failed: {err}", style.label());
+            }
+        }
+    }
+    ui_info(shared, format!("{serial}: no root access (su not available or denied)"));
+    None
+}
+
+/// Stops leftover daemons. The root variant is only attempted when `su` is known to work.
+fn kill_daemons(device: &adb::Device, su: Option<SuStyle>) {
+    let _ = shell(device, KILL_SCRIPT);
+    if let Some(style) = su {
+        let script = daemon_cmd::wrap(Access::Root(style), KILL_SCRIPT);
+        let _ = device.shell_timeout(&script, Duration::from_secs(8));
+    }
+}
+
+struct Session {
+    stream: TcpStream,
+    hello: responses::Hello,
+    access: Access,
+    /// Set when the host stops the daemon on purpose, so its watcher thread
+    /// does not unmount the drive that replaced it.
+    stop: Arc<AtomicBool>,
+}
+
+enum HandshakeFailure {
+    NotReady(String),
+    WrongDaemon,
+}
+
+/// Connect + `Hello`. With `adb forward`, connecting succeeds even before the
+/// daemon listens (adb accepts locally and drops the connection later), so this
+/// only counts as success when the daemon answers with the expected token.
+fn try_handshake(port: u16, token: &str) -> Result<(TcpStream, responses::Hello), HandshakeFailure> {
+    let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(1500))
+        .map_err(|err| HandshakeFailure::NotReady(err.to_string()))?;
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+    match Client::handshake(&mut stream) {
+        Ok(hello) => {
+            if hello.protocol != responses::PROTOCOL_VERSION || hello.token != token {
+                return Err(HandshakeFailure::WrongDaemon);
+            }
+            let _ = stream.set_read_timeout(None);
+            let _ = stream.set_write_timeout(None);
+            Ok((stream, hello))
+        }
+        Err(err) => Err(HandshakeFailure::NotReady(err.to_string())),
+    }
+}
+
+/// Starts the daemon with the given access and waits until it really answers.
+fn start_daemon(
+    device: &adb::Device,
+    shared: &SharedState,
+    letter: &str,
+    port: u16,
+    access: Access,
+    root_setting: &str,
+) -> Result<Session, SetupError> {
+    let serial = device.serial_number.clone();
+    let su = match access {
+        Access::Root(style) => Some(style),
+        Access::Shell { .. } => None,
+    };
+    kill_daemons(device, su);
+    std::thread::sleep(Duration::from_millis(250));
+
+    let root_arg = if root_setting.trim().is_empty() {
+        None
+    } else if is_safe_android_path(root_setting) {
+        Some(root_setting.trim())
+    } else {
+        warn!("{serial}: ignoring unsafe root {root_setting:?}");
+        None
+    };
+    let token = daemon_cmd::make_token();
+    let command = daemon_cmd::wrap(access, &daemon_cmd::server_command(root_arg, &token));
+    debug!("{serial}: starting daemon: {command}");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let exit_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    {
+        let device = device.clone();
+        let shared = shared.clone();
+        let stop = stop.clone();
+        let exit_text = exit_text.clone();
+        let serial = serial.clone();
+        let letter = letter.to_string();
+        std::thread::spawn(move || {
+            let text = match shell(&device, &command) {
+                Ok(out) => output_text(&out),
+                Err(err) => err.to_string(),
+            };
+            info!("Daemon for {serial} exited: {text}");
+            *exit_text.lock().unwrap_or_else(|p| p.into_inner()) = Some(text);
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let still_mounted = {
+                let guard = lock(&shared);
+                guard.devices.iter().any(|entry| {
+                    entry.serial == serial
+                        && matches!(&entry.state, DeviceState::Mounted(l) if *l == letter)
+                })
+            };
+            if still_mounted {
+                if !dokan::unmount(U16CString::from_str(&letter).unwrap()) {
+                    warn!("Failed to unmount {letter} for {serial}");
+                }
+                ui_info(&shared, format!("Device {serial} disconnected"));
+            }
+        });
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last_detail: String;
+    loop {
+        if let Some(text) = exit_text.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+            return Err(SetupError::DaemonExited(if text.is_empty() {
+                "no output".to_string()
+            } else {
+                text
+            }));
+        }
+        match try_handshake(port, &token) {
+            Ok((stream, hello)) => {
+                return Ok(Session {
+                    stream,
+                    hello,
+                    access,
+                    stop,
+                });
+            }
+            Err(HandshakeFailure::WrongDaemon) => {
+                stop.store(true, Ordering::SeqCst);
+                return Err(SetupError::StaleDaemon);
+            }
+            Err(HandshakeFailure::NotReady(detail)) => last_detail = detail,
+        }
+        if Instant::now() >= deadline {
+            stop.store(true, Ordering::SeqCst);
+            kill_daemons(device, su);
+            return Err(SetupError::DaemonUnreachable(last_detail));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Like `start_daemon`, and when a stale daemon (e.g. one started as root by an
+/// earlier run) still owns the port, clears it once and tries again.
+fn start_daemon_clearing_stale(
+    device: &adb::Device,
+    shared: &SharedState,
+    letter: &str,
+    port: u16,
+    access: Access,
+    root_setting: &str,
+) -> Result<Session, SetupError> {
+    match start_daemon(device, shared, letter, port, access, root_setting) {
+        Err(SetupError::StaleDaemon) => {
+            ui_info(
+                shared,
+                format!("{}: stopping an old daemon", device.serial_number),
+            );
+            let known = lock(shared)
+                .entry_mut(&device.serial_number)
+                .and_then(|entry| entry.su_style);
+            let style = known.or_else(|| probe_root(device, shared));
+            kill_daemons(device, style);
+            std::thread::sleep(Duration::from_millis(600));
+            start_daemon(device, shared, letter, port, access, root_setting)
+        }
+        other => other,
+    }
+}
+
+fn stop_session(device: &adb::Device, session: Session) {
+    session.stop.store(true, Ordering::SeqCst);
+    let su = match session.access {
+        Access::Root(style) => Some(style),
+        Access::Shell { .. } => None,
+    };
+    drop(session.stream);
+    kill_daemons(device, su);
+    std::thread::sleep(Duration::from_millis(300));
+}
+
+/// Picks shell or root according to the access mode, and in Auto mode moves to
+/// root when the shell user cannot read the chosen folder (the typical cause of
+/// a drive that mounts but looks empty in Explorer).
+fn launch_daemon(
+    device: &adb::Device,
+    shared: &SharedState,
+    letter: &str,
+    port: u16,
+    mode: AccessMode,
+    root_setting: &str,
+) -> Result<Session, SetupError> {
+    let serial = device.serial_number.clone();
+    let shell_access = Access::Shell {
+        uid_zero: shell_is_root(device),
+    };
+
+    let start_root = |device: &adb::Device| -> Result<Session, SetupError> {
+        let style = probe_root(device, shared).ok_or(SetupError::NoRoot)?;
+        start_daemon_clearing_stale(device, shared, letter, port, Access::Root(style), root_setting)
+    };
+
+    if mode == AccessMode::Root && !shell_access.is_root() {
+        return start_root(device);
+    }
+
+    let session = match start_daemon_clearing_stale(device, shared, letter, port, shell_access, root_setting) {
+        Ok(session) => session,
+        Err(err) if mode == AccessMode::Auto => {
+            ui_info(shared, format!("{serial}: starting without root failed ({err}); trying root"));
+            return start_root(device).map_err(|_| err);
+        }
+        Err(err) => return Err(err),
+    };
+
+    let unreadable = session.hello.root_fallback || session.hello.root_entries.is_none();
+    if mode == AccessMode::Auto && !session.access.is_root() && unreadable {
+        ui_info(
+            shared,
+            format!(
+                "{serial}: the shell user cannot read the selected folder ({}); looking for root",
+                session.hello.note.clone().unwrap_or_default()
+            ),
+        );
+        if let Some(style) = probe_root(device, shared) {
+            stop_session(device, session);
+            match start_daemon_clearing_stale(device, shared, letter, port, Access::Root(style), root_setting) {
+                Ok(rooted) => return Ok(rooted),
+                Err(err) => {
+                    ui_error(shared, format!("{serial}: root start failed ({err}); continuing without root"));
+                    return start_daemon_clearing_stale(device, shared, letter, port, shell_access, root_setting);
+                }
+            }
+        }
+    }
+    Ok(session)
 }
 
 fn setup(device: adb::Device, shared: &SharedState) -> Result<String, SetupError> {
@@ -220,18 +546,67 @@ fn setup(device: adb::Device, shared: &SharedState) -> Result<String, SetupError
         }
     }
 
-    let (letter, root) = {
+    let (letter, root, mode) = {
         let mut guard = lock(shared);
         let letter = pick_letter(&guard.reserved).ok_or(SetupError::NoAvailableDriveLetter)?;
         guard.reserved.insert(letter.to_string());
-        (letter.to_string(), guard.settings.root.clone())
+        (
+            letter.to_string(),
+            guard.settings.root.clone(),
+            guard.settings.access_mode,
+        )
     };
 
-    let result = setup_reserved(device, shared, &letter, binary, &root);
+    let result = setup_reserved(device, shared, &letter, binary, &root, mode);
     if result.is_err() {
         lock(shared).reserved.remove(&letter);
     }
     result
+}
+
+fn forward_free_port(device: &adb::Device) -> Result<u16, SetupError> {
+    for port in BASE_PORT..=MAX_PORT {
+        // --no-rebind: never steal a port that another device (or another
+        // instance) already forwards; a plain `forward` silently replaces it.
+        match device.invoke_result(vec![
+            "forward".to_string(),
+            "--no-rebind".to_string(),
+            format!("tcp:{port}"),
+            format!("tcp:{DAEMON_PORT}"),
+        ]) {
+            Ok(_) => return Ok(port),
+            Err(err) => debug!("port {port} unavailable: {err}"),
+        }
+    }
+    Err(SetupError::NoAvailablePort)
+}
+
+fn remove_forward(device: &adb::Device, port: u16) {
+    let _ = device.invoke_result(vec![
+        "forward".to_string(),
+        "--remove".to_string(),
+        format!("tcp:{port}"),
+    ]);
+}
+
+fn push_daemon(device: &adb::Device, binary: &[u8]) -> Result<(), SetupError> {
+    kill_daemons(device, None);
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = shell(device, &format!("rm -f {SERVER_PATH}"));
+
+    let mut staged = tempfile::NamedTempFile::new()?;
+    staged.write_all(binary)?;
+    staged.flush()?;
+    let staged_path = staged
+        .path()
+        .to_str()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "temp path is not utf-8")
+        })?
+        .to_string();
+    device.invoke_result(vec!["push".to_string(), staged_path, SERVER_PATH.to_string()])?;
+    shell(device, &format!("chmod 755 {SERVER_PATH}"))?;
+    Ok(())
 }
 
 fn setup_reserved(
@@ -240,58 +615,10 @@ fn setup_reserved(
     letter: &str,
     binary: &'static [u8],
     root_setting: &str,
+    mode: AccessMode,
 ) -> Result<String, SetupError> {
-    let mut chosen_port = None;
-    for port in BASE_PORT..=MAX_PORT {
-        match device.invoke_result(vec![
-            "forward".to_string(),
-            format!("tcp:{port}"),
-            "tcp:12345".to_string(),
-        ]) {
-            Ok(_) => {
-                chosen_port = Some(port);
-                break;
-            }
-            Err(err) => debug!("port {port} unavailable: {err}"),
-        }
-    }
-    let port = chosen_port.ok_or(SetupError::NoAvailablePort)?;
-    debug!("Forwarded tcp:{port} -> tcp:12345");
-
-    let cleanup_forward = |device: &adb::Device, port: u16| {
-        let _ = device.invoke_result(vec![
-            "forward".to_string(),
-            "--remove".to_string(),
-            format!("tcp:{port}"),
-        ]);
-    };
-
-    if let Err(err) = (|| -> Result<(), SetupError> {
-        let _ = shell(&device, "killall androidfs_server >/dev/null 2>&1 || true");
-        std::thread::sleep(Duration::from_millis(200));
-        let _ = shell(&device, "rm -f /data/local/tmp/androidfs_server");
-
-        let mut staged = tempfile::NamedTempFile::new()?;
-        staged.write_all(binary)?;
-        staged.flush()?;
-        let staged_path = staged
-            .path()
-            .to_str()
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "temp path is not utf-8")
-            })?
-            .to_string();
-        device.invoke_result(vec![
-            "push".to_string(),
-            staged_path,
-            SERVER_PUSH_PATH.to_string(),
-        ])?;
-        shell(&device, "chmod 755 /data/local/tmp/androidfs_server")?;
-        Ok(())
-    })() {
-        cleanup_forward(&device, port);
-        return Err(err);
-    }
+    let port = forward_free_port(&device)?;
+    debug!("Forwarded tcp:{port} -> tcp:{DAEMON_PORT}");
 
     let root = if root_setting.trim().is_empty() {
         std::env::var("ANDROIDFS_ROOT").unwrap_or_default()
@@ -299,110 +626,167 @@ fn setup_reserved(
         root_setting.to_string()
     };
 
-    let serial = device.serial_number.clone();
-    let letter_owned = letter.to_string();
-    let device_for_daemon = device.clone();
-    let shared_for_daemon = shared.clone();
-    std::thread::spawn(move || {
-        debug!("Starting on-device daemon for {serial}");
-        let mut command = String::from("/data/local/tmp/androidfs_server");
-        if !root.trim().is_empty() {
-            if is_safe_android_path(&root) {
-                command.push(' ');
-                command.push_str(root.trim());
-                info!("{serial}: using root {}", root.trim());
-            } else {
-                warn!("{serial}: ignoring unsafe root {root:?}");
-            }
-        }
-        let run = shell(&device_for_daemon, &command);
-        if let Err(err) = &run {
-            error!("Daemon for {serial} stopped with an error: {err}");
-        } else {
-            info!("Daemon for {serial} exited");
-        }
-        let still_mounted = {
-            let guard = lock(&shared_for_daemon);
-            guard.devices.iter().any(|device| {
-                device.serial == serial
-                    && matches!(&device.state, DeviceState::Mounted(l) if *l == letter_owned)
-            })
-        };
-        if still_mounted {
-            if !dokan::unmount(U16CString::from_str(&letter_owned).unwrap()) {
-                warn!("Failed to unmount {letter_owned} for {serial}");
-            }
-            info!("Device {serial} disconnected");
-        }
-    });
+    if let Err(err) = push_daemon(&device, binary) {
+        remove_forward(&device, port);
+        return Err(err);
+    }
 
-    let stream = match connect_with_retry(port) {
-        Ok(stream) => stream,
-        Err(_) => {
-            let _ = shell(&device, "killall androidfs_server >/dev/null 2>&1 || true");
-            cleanup_forward(&device, port);
-            return Err(SetupError::DaemonUnreachable);
+    let session = match launch_daemon(&device, shared, letter, port, mode, &root) {
+        Ok(session) => session,
+        Err(err) => {
+            remove_forward(&device, port);
+            return Err(err);
         }
     };
 
-    let label = volume_label(&device.serial_number);
+    let serial = device.serial_number.clone();
+    let hello = session.hello.clone();
+    let access = session.access;
+    let access_label = access.label();
+    ui_info(
+        shared,
+        format!(
+            "{serial}: daemon runs as {access_label}, uid {}, folder {}, {}",
+            hello.uid,
+            hello.root,
+            match hello.root_entries {
+                Some(count) => format!("{count} entries"),
+                None => "folder cannot be listed".to_string(),
+            }
+        ),
+    );
+    if let Some(note) = &hello.note {
+        ui_info(shared, format!("{serial}: {note}"));
+    }
+    if hello.root_entries.is_none() || hello.root_fallback {
+        let hint = if access.is_root() {
+            "Even root cannot read this folder; pick another Drive root in Settings."
+        } else {
+            "Without root this folder is not readable. Set the access mode to Root (or Auto on a rooted phone), or pick another Drive root in Settings."
+        };
+        ui_error(shared, format!("{serial}: {hint}"));
+    } else if hello.root_entries == Some(0) {
+        ui_info(
+            shared,
+            format!("{serial}: the folder {} is empty on the phone", hello.root),
+        );
+    }
+
+    let stream = session.stream;
+    let label = volume_label(&serial);
     let volume_name =
         U16CString::from_str(&label).unwrap_or_else(|_| U16CString::from_str("Android").unwrap());
     let mount_point = U16CString::from_str(letter).unwrap();
-    let serial = device.serial_number.clone();
     let letter_for_mount = letter.to_string();
     let shared_for_mount = shared.clone();
     let device_for_cleanup = device.clone();
+    let serial_for_mount = serial.clone();
+    let finished = Arc::new(AtomicBool::new(false));
+    let mount_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     {
-        let mut guard = lock(shared);
-        if let Some(entry) = guard.entry_mut(&device.serial_number) {
-            entry.state = DeviceState::Mounted(letter.to_string());
-            entry.retry_after = None;
-        }
-    }
-    std::thread::spawn(move || {
-        let handler = QuestFsHandler::new(Client::new(stream), volume_name);
-        let mut failure: Option<String> = None;
-        match Drive::new()
-            .mount_point(&mount_point)
-            .flags(MountFlags::CASE_SENSITIVE)
-            .thread_count(0)
-            .mount(&handler)
-        {
-            Ok(_) => debug!("Mount thread for {serial} exited"),
-            Err(err) => {
-                error!("Mount error for {serial}: {err}");
-                failure = Some(format!("Dokan could not mount the drive: {err}. Is Dokan 1.5 installed?"));
+        let finished = finished.clone();
+        let mount_error = mount_error.clone();
+        std::thread::spawn(move || {
+            let serial = serial_for_mount;
+            let handler = QuestFsHandler::new(Client::new(stream), volume_name);
+            let mut failure: Option<String> = None;
+            match Drive::new()
+                .mount_point(&mount_point)
+                .flags(MountFlags::CASE_SENSITIVE)
+                .thread_count(0)
+                .mount(&handler)
+            {
+                Ok(_) => debug!("Mount thread for {serial} exited"),
+                Err(err) => {
+                    error!("Mount error for {serial}: {err}");
+                    failure = Some(format!(
+                        "Dokan could not mount the drive: {err}. Is Dokan 1.5 installed? (restart Windows after installing it)"
+                    ));
+                }
             }
-        }
-        let _ = device_for_cleanup.invoke_result(vec![
-            "forward".to_string(),
-            "--remove".to_string(),
-            format!("tcp:{port}"),
-        ]);
-        {
-            let mut guard = lock(&shared_for_mount);
-            guard.reserved.remove(&letter_for_mount);
-            if let Some(entry) = guard.entry_mut(&serial) {
-                match &failure {
-                    Some(msg) => {
-                        entry.state = DeviceState::Failed(msg.clone());
-                        entry.retry_after = Some(Instant::now() + Duration::from_secs(15));
-                    }
-                    None => {
-                        entry.state = DeviceState::Detected;
-                        if !entry.manual_hold {
-                            entry.retry_after = Some(Instant::now() + Duration::from_secs(5));
+            remove_forward(&device_for_cleanup, port);
+            {
+                let mut guard = lock(&shared_for_mount);
+                guard.reserved.remove(&letter_for_mount);
+                if let Some(entry) = guard.entry_mut(&serial) {
+                    match &failure {
+                        Some(msg) => {
+                            entry.state = DeviceState::Failed(msg.clone());
+                            entry.retry_after = Some(Instant::now() + Duration::from_secs(15));
+                        }
+                        None => {
+                            entry.state = DeviceState::Detected;
+                            entry.info = None;
+                            if !entry.manual_hold {
+                                entry.retry_after = Some(Instant::now() + Duration::from_secs(5));
+                            }
                         }
                     }
                 }
             }
+            match &failure {
+                Some(msg) => ui_error(&shared_for_mount, format!("{serial}: {msg}")),
+                None => ui_info(&shared_for_mount, format!("{serial} unmounted")),
+            }
+            *mount_error.lock().unwrap_or_else(|p| p.into_inner()) = failure;
+            finished.store(true, Ordering::SeqCst);
+        });
+    }
+
+    // Do not report "Mounted" before Windows can actually see the drive.
+    let drive_path = format!("{letter}\\");
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if finished.load(Ordering::SeqCst) {
+            let detail = mount_error
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+                .unwrap_or_else(|| "the drive was unmounted right after mounting".to_string());
+            return Err(SetupError::MountFailed(detail));
         }
-        match failure {
-            Some(msg) => ui_error(&shared_for_mount, format!("{serial}: {msg}")),
-            None => ui_info(&shared_for_mount, format!("{serial} unmounted")),
+        if Path::new(&drive_path).exists() {
+            break;
         }
-    });
+        if Instant::now() >= ready_deadline {
+            warn!("{serial}: drive {drive_path} did not appear within 10 s");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    {
+        let mut guard = lock(shared);
+        if let Some(entry) = guard.entry_mut(&serial) {
+            entry.state = DeviceState::Mounted(letter.to_string());
+            entry.retry_after = None;
+            entry.info = Some(MountInfo {
+                access: access_label,
+                root_dir: hello.root.clone(),
+                entries: hello.root_entries,
+                note: hello.note.clone(),
+            });
+        }
+    }
+
+    // Self-check from the Windows side: what does Explorer's own listing see?
+    match std::fs::read_dir(&drive_path) {
+        Ok(entries) => {
+            let seen = entries.filter(|entry| entry.is_ok()).count();
+            ui_info(shared, format!("{serial}: {drive_path} lists {seen} entries"));
+            if seen == 0 && hello.root_entries.unwrap_or(0) > 0 {
+                ui_error(
+                    shared,
+                    format!(
+                        "{serial}: the daemon sees {} entries but Windows lists none; see {} for details",
+                        hello.root_entries.unwrap_or(0),
+                        crate::settings::log_path().display()
+                    ),
+                );
+            }
+        }
+        Err(err) => ui_error(shared, format!("{serial}: cannot list {drive_path}: {err}")),
+    }
 
     Ok(letter.to_string())
 }
@@ -413,27 +797,6 @@ fn volume_label(serial: &str) -> String {
         label.truncate(31);
     }
     label
-}
-
-fn connect_with_retry(port: u16) -> std::io::Result<TcpStream> {
-    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
-    let mut last = None;
-    for attempt in 0..40 {
-        match TcpStream::connect(address) {
-            Ok(stream) => return Ok(stream),
-            Err(err) => {
-                last = Some(err);
-                if attempt == 0 {
-                    std::thread::sleep(Duration::from_millis(300));
-                } else {
-                    std::thread::sleep(Duration::from_millis(250));
-                }
-            }
-        }
-    }
-    Err(last.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::TimedOut, "daemon did not come up")
-    }))
 }
 
 fn mount_now(shared: &SharedState, bridge: &adb::DebugBridge, serial: &str) {
@@ -539,6 +902,8 @@ fn poll_devices(shared: &SharedState, bridge: &adb::DebugBridge) {
                     state: DeviceState::Detected,
                     manual_hold: false,
                     retry_after: None,
+                    info: None,
+                    su_style: None,
                 });
                 guard.push_log(format!("Device detected: {serial}"));
             }

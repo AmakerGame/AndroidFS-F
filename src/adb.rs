@@ -1,7 +1,8 @@
 use std::fmt::Display;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use log::trace;
 use winapi::um::winbase::CREATE_NO_WINDOW;
@@ -30,6 +31,7 @@ pub enum ErrorKind {
     LaunchFailed,
     NonSuccessExitCode,
     ParseFailure,
+    TimedOut,
 }
 
 impl Display for Error {
@@ -69,6 +71,71 @@ impl Invokeable for Device {
         command.insert(0, "-s".to_string());
         command.insert(1, self.serial_number.clone());
         self.debug_bridge.invoke(command)
+    }
+}
+
+impl Device {
+    /// Runs `adb -s <serial> shell <script>` but gives up after `timeout`.
+    /// Needed for `su`, which may wait for a grant prompt on the phone screen.
+    pub fn shell_timeout(
+        &self,
+        script: &str,
+        timeout: Duration,
+    ) -> std::result::Result<Output, Error> {
+        let args = vec![
+            "-s".to_string(),
+            self.serial_number.clone(),
+            "shell".to_string(),
+            script.to_string(),
+        ];
+        run_with_timeout(&self.debug_bridge.adb_path, &args, timeout)
+    }
+}
+
+fn run_with_timeout(
+    adb_path: &str,
+    args: &[String],
+    timeout: Duration,
+) -> std::result::Result<Output, Error> {
+    trace!("Invoking ADB ({adb_path}) with timeout {timeout:?}: {args:?}");
+    let mut child = Command::new(adb_path)
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| Error {
+            kind: ErrorKind::LaunchFailed,
+            message: format!("could not run adb at \"{adb_path}\": {err}"),
+        })?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child.wait_with_output().map_err(|err| Error {
+                    kind: ErrorKind::LaunchFailed,
+                    message: format!("could not read adb output: {err}"),
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(Error {
+                        kind: ErrorKind::TimedOut,
+                        message: format!("adb did not answer within {} s", timeout.as_secs()),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            Err(err) => {
+                return Err(Error {
+                    kind: ErrorKind::LaunchFailed,
+                    message: format!("could not wait for adb: {err}"),
+                });
+            }
+        }
     }
 }
 

@@ -1,4 +1,5 @@
 pub mod adb_parse;
+pub mod daemon_cmd;
 pub mod models;
 pub mod requests;
 pub mod responses;

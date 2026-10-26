@@ -1,7 +1,7 @@
 ; Inno Setup script for AndroidFS-F.
 
 #define MyAppName "AndroidFS-F"
-#define MyAppVersion "0.3.0"
+#define MyAppVersion "0.4.0"
 #define MyAppPublisher "AndroidFS-F"
 #define MyAppURL "https://github.com/Lauriethefish/AndroidFS"
 #define MyAppExeName "androidfs_driver.exe"

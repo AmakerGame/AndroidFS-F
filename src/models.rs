@@ -22,3 +22,7 @@ pub fn is_dir_mode(mode: u32) -> bool {
 pub fn is_link_mode(mode: u32) -> bool {
     mode & 0xF000 == 0xA000
 }
+
+pub fn is_regular_mode(mode: u32) -> bool {
+    mode & 0xF000 == 0x8000
+}

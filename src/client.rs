@@ -84,6 +84,15 @@ impl Client {
         }
     }
 
+    /// First exchange on a fresh connection. Going through `adb forward`, a TCP
+    /// connect succeeds even while nothing listens on the phone yet (adb accepts
+    /// it locally and drops it later), so a connect alone proves nothing. Only a
+    /// valid answer to `Hello` means the daemon is really there.
+    pub fn handshake(connection: &mut TcpStream) -> Result<responses::Hello> {
+        Self::write_request(connection, &requests::Request::Hello)?;
+        Self::read_response::<responses::Hello>(connection)
+    }
+
     fn read_response<T: DeserializeOwned>(connection: &mut TcpStream) -> Result<T> {
         let length = connection.read_u64::<BigEndian>()?;
         if length > MAX_FRAME {

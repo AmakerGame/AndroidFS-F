@@ -6,7 +6,7 @@ use widestring::{U16CStr, U16CString};
 use winapi::shared::ntstatus::*;
 use winapi::um::winnt::{
     self, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
-    FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT, PSECURITY_DESCRIPTOR,
+    FILE_ATTRIBUTE_RECALL_ON_OPEN, PSECURITY_DESCRIPTOR,
 };
 
 use crate::cache::Cache;
@@ -75,14 +75,17 @@ fn wants_directory(create_options: u32, file_attributes: u32) -> bool {
 }
 
 fn convert_attributes(file: &models::FileInfo) -> u32 {
-    let mut attributes = FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN;
-    if models::is_link_mode(file.mode) {
-        attributes |= FILE_ATTRIBUTE_REPARSE_POINT;
-    }
     if models::is_dir_mode(file.mode) {
-        attributes |= FILE_ATTRIBUTE_DIRECTORY;
+        // Plain directory. The "recall" flags mark a cloud placeholder that still
+        // has to be downloaded; on a folder they make Explorer treat it as
+        // offline content, and a reparse-point flag on a folder that is not a
+        // real reparse point makes it unreadable.
+        return FILE_ATTRIBUTE_DIRECTORY;
     }
-    attributes
+    // Files keep the recall flags: Windows then does not read file contents just
+    // to draw thumbnails or scan them, which would be very slow over ADB.
+    // (Symlinks are already resolved by the daemon, so there is no reparse flag.)
+    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN
 }
 
 impl QuestFsHandler {
@@ -363,14 +366,21 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for QuestFsHandler {
             let Ok(file_name) = U16CString::from_str(file.name.as_str()) else {
                 continue;
             };
-            fill_find_data(&FindData {
+            let result = fill_find_data(&FindData {
                 attributes: convert_attributes(file),
                 creation_time: file.creation_time,
                 last_access_time: file.last_accessed,
                 last_write_time: file.last_modified,
                 file_size: file.size,
                 file_name,
-            })?;
+            });
+            match result {
+                Ok(()) => {}
+                // One over-long name must not abort the whole listing
+                // (the `?` operator would turn it into an error for the folder).
+                Err(FillDataError::NameTooLong) => continue,
+                Err(err) => return Err(err.into()),
+            }
         }
         Ok(())
     }

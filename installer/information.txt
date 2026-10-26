@@ -5,7 +5,8 @@ with USB debugging enabled and allow this computer on the phone screen. The phon
 appears in the device list and is mounted as the first free drive letter,
 starting at Q:.
 
-Supported phones: arm64-v8a and armeabi-v7a.
+Supported phones: arm64-v8a and armeabi-v7a, with or without root.
+Access mode (Automatic / Without root / Root) is set in Settings.
 
 Settings and the log are stored in %APPDATA%\AndroidFS-F. adb.exe must be on
 PATH, or set its location in Settings.

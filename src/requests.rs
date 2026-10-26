@@ -16,6 +16,9 @@ pub enum Request {
     Read(ReadFile),
     Write(WriteFile),
     SetEndOfFile(SetEndOfFile),
+    /// Handshake: asks the daemon who it is (token, user id, drive root).
+    /// Appended last so the wire format of the other requests is unchanged.
+    Hello,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

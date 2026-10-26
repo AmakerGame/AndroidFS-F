@@ -3,11 +3,46 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::models::{FileHandle, FileInfo};
+use std::os::unix::fs::MetadataExt;
+
+use crate::models::{self, FileHandle, FileInfo};
 use crate::requests::{self, WRITE_AT_END};
 use crate::responses::{self, Error};
 
 const MAX_IO: u64 = 8 * 1024 * 1024;
+
+/// Shared-storage folders on different Android versions and TV boxes.
+const ROOT_CANDIDATES: &[&str] = &[
+    "/storage/emulated/0",
+    "/sdcard",
+    "/storage/self/primary",
+    "/mnt/sdcard",
+    "/storage/emulated/legacy",
+    "/storage/sdcard0",
+    "/mnt/shell/emulated/0",
+    "/mnt/runtime/default/emulated/0",
+    "/data/media/0",
+];
+
+/// The folder that is served, and why it was chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootChoice {
+    pub path: PathBuf,
+    /// The requested folder could not be read, so another one was picked.
+    pub fallback: bool,
+    pub note: Option<String>,
+}
+
+pub fn can_list(path: &Path) -> bool {
+    fs::read_dir(path).is_ok()
+}
+
+/// Entry count of a folder, `None` when it cannot be listed.
+pub fn count_entries(path: &Path) -> Option<u32> {
+    fs::read_dir(path)
+        .ok()
+        .map(|entries| entries.filter(|entry| entry.is_ok()).count() as u32)
+}
 
 struct OpenedFile {
     file: File,
@@ -33,8 +68,9 @@ impl FsService {
         &self.root
     }
 
-    /// Prefer the shared storage users actually want in Explorer.
-    /// `ANDROIDFS_ROOT` overrides detection. `/` is the fallback (full shell view).
+    /// First readable folder that holds the user's shared storage. The list
+    /// covers phones (Android 4 to 15) and TV boxes; `ANDROIDFS_ROOT` overrides
+    /// detection. `/` is the last resort (whole filesystem).
     pub fn detect_root() -> PathBuf {
         if let Ok(explicit) = std::env::var("ANDROIDFS_ROOT") {
             let explicit = explicit.trim();
@@ -42,12 +78,60 @@ impl FsService {
                 return PathBuf::from(explicit);
             }
         }
-        for candidate in ["/storage/emulated/0", "/sdcard", "/mnt/sdcard"] {
-            if Path::new(candidate).is_dir() {
-                return PathBuf::from(candidate);
+        // `read_dir`, not `is_dir`: a folder that exists but may not be listed
+        // by this user (permission denied) must be skipped, otherwise the drive
+        // mounts fine and Explorer shows it empty.
+        ROOT_CANDIDATES
+            .iter()
+            .map(Path::new)
+            .find(|candidate| can_list(candidate))
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("/"))
+    }
+
+    /// Picks the folder to serve. `requested` is what the user configured
+    /// (`None` = auto-detect). An unreadable request falls back to detection and
+    /// says so, so the host can retry as root or tell the user what happened.
+    pub fn choose_root(requested: Option<&Path>) -> RootChoice {
+        if let Some(requested) = requested {
+            return match fs::read_dir(requested) {
+                Ok(_) => RootChoice {
+                    path: requested.to_path_buf(),
+                    fallback: false,
+                    note: None,
+                },
+                Err(err) => {
+                    let path = Self::detect_root();
+                    let note = format!(
+                        "cannot read {}: {err}; showing {} instead",
+                        requested.display(),
+                        path.display()
+                    );
+                    RootChoice {
+                        path,
+                        fallback: true,
+                        note: Some(note),
+                    }
+                }
+            };
+        }
+        let path = Self::detect_root();
+        if path == Path::new("/") && !can_list(Path::new("/storage/emulated/0")) {
+            RootChoice {
+                path,
+                fallback: true,
+                note: Some(
+                    "shared storage is not readable by this user; showing the whole filesystem"
+                        .to_string(),
+                ),
+            }
+        } else {
+            RootChoice {
+                path,
+                fallback: false,
+                note: None,
             }
         }
-        PathBuf::from("/")
     }
 
     pub fn resolve_path(root: &Path, raw: &str) -> responses::Result<PathBuf> {
@@ -117,11 +201,25 @@ impl FsService {
             if name == "." || name == ".." {
                 continue;
             }
-            let meta = match stat_follow(&entry.path()) {
-                Ok(meta) => meta,
-                Err(_) => continue,
+            let info = match stat_follow(&entry.path()) {
+                Ok(meta) => {
+                    let mode = meta.mode();
+                    // Sockets, FIFOs and device nodes (common in `/`) would hang
+                    // or confuse Explorer; only folders and regular files are shown.
+                    if !models::is_dir_mode(mode) && !models::is_regular_mode(mode) {
+                        continue;
+                    }
+                    metadata_to_file_info(name, &meta)
+                }
+                // Cannot stat (typically permission denied on /data/*, Android/data):
+                // still show it, so the listing is not mysteriously empty.
+                Err(_) => match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => placeholder_info(name, true),
+                    Ok(kind) if kind.is_file() => placeholder_info(name, false),
+                    _ => continue, // broken symlink or special file
+                },
             };
-            files.push(metadata_to_file_info(name, &meta));
+            files.push(info);
         }
         files.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(files)
@@ -303,8 +401,19 @@ fn stat_follow(path: &Path) -> std::io::Result<fs::Metadata> {
     fs::metadata(path).or_else(|_| fs::symlink_metadata(path))
 }
 
+fn placeholder_info(name: String, is_dir: bool) -> FileInfo {
+    FileInfo {
+        name,
+        size: 0,
+        last_accessed: SystemTime::UNIX_EPOCH,
+        last_modified: SystemTime::UNIX_EPOCH,
+        creation_time: SystemTime::UNIX_EPOCH,
+        mode: if is_dir { 0o040_555 } else { 0o100_444 },
+        ino: 0,
+    }
+}
+
 fn metadata_to_file_info(name: String, metadata: &fs::Metadata) -> FileInfo {
-    use std::os::unix::fs::MetadataExt;
     FileInfo {
         name,
         size: metadata.len(),
@@ -492,6 +601,41 @@ mod tests {
         })
         .unwrap();
         assert_eq!(svc.delete("/keep"), Err(Error::DirectoryNotEmpty));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unreadable_root_falls_back_with_a_note() {
+        let root = temp_root();
+        let ok = FsService::choose_root(Some(&root));
+        assert_eq!(ok.path, root);
+        assert!(!ok.fallback);
+        assert!(ok.note.is_none());
+
+        let missing = root.join("does-not-exist");
+        let choice = FsService::choose_root(Some(&missing));
+        assert!(choice.fallback);
+        assert_ne!(choice.path, missing);
+        assert!(choice.note.unwrap().contains("does-not-exist"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn listing_skips_special_files_and_broken_links() {
+        let root = temp_root();
+        fs::create_dir(root.join("dir")).unwrap();
+        fs::write(root.join("file.txt"), b"abc").unwrap();
+        std::os::unix::fs::symlink(root.join("nowhere"), root.join("broken")).unwrap();
+        std::os::unix::fs::symlink(root.join("dir"), root.join("link-to-dir")).unwrap();
+        let svc = FsService::new(root.clone());
+        let names: Vec<String> = svc
+            .list_files("/")
+            .unwrap()
+            .into_iter()
+            .map(|info| info.name)
+            .collect();
+        assert_eq!(names, vec!["dir", "file.txt", "link-to-dir"]);
+        assert_eq!(count_entries(&root), Some(4));
         let _ = fs::remove_dir_all(&root);
     }
 }

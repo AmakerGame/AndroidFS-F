@@ -1,59 +1,178 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use serde::Serialize;
 
-use crate::fs_ops::FsService;
+use crate::daemon_cmd::DAEMON_PORT;
+use crate::fs_ops::{self, FsService};
 use crate::requests;
 use crate::responses;
 
 const MAX_FRAME: u64 = 16 * 1024 * 1024;
 
-pub fn run() {
-    let root = match std::env::args().nth(1) {
-        Some(arg) if !arg.trim().is_empty() => std::path::PathBuf::from(arg),
-        _ => FsService::detect_root(),
+/// Command line: `androidfs_server [--token T] [--root PATH] [--port N] [PATH]`.
+/// A bare `PATH` is accepted for compatibility with older hosts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    pub root: Option<PathBuf>,
+    pub token: String,
+    pub port: u16,
+}
+
+pub fn parse_args(args: &[String]) -> Config {
+    let mut config = Config {
+        root: None,
+        token: String::new(),
+        port: DAEMON_PORT,
     };
-    if !root.is_dir() {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--token" => {
+                if let Some(value) = iter.next() {
+                    config.token = value.clone();
+                }
+            }
+            "--root" => {
+                if let Some(value) = iter.next() {
+                    if !value.trim().is_empty() {
+                        config.root = Some(PathBuf::from(value.trim()));
+                    }
+                }
+            }
+            "--port" => {
+                if let Some(value) = iter.next() {
+                    if let Ok(port) = value.parse() {
+                        config.port = port;
+                    }
+                }
+            }
+            other if !other.starts_with("--") && !other.trim().is_empty() => {
+                config.root = Some(PathBuf::from(other.trim()));
+            }
+            _ => {}
+        }
+    }
+    config
+}
+
+fn current_uid() -> u32 {
+    unsafe { libc::getuid() as u32 }
+}
+
+pub fn build_hello(config: &Config, choice: &fs_ops::RootChoice) -> responses::Hello {
+    responses::Hello {
+        protocol: responses::PROTOCOL_VERSION,
+        token: config.token.clone(),
+        uid: current_uid(),
+        root: choice.path.to_string_lossy().into_owned(),
+        root_entries: fs_ops::count_entries(&choice.path),
+        root_fallback: choice.fallback,
+        note: choice.note.clone(),
+    }
+}
+
+pub fn run() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let config = parse_args(&args);
+    let choice = FsService::choose_root(config.root.as_deref());
+    if !choice.path.is_dir() {
         eprintln!(
             "AndroidFS server: root {} is not a directory",
-            root.display()
+            choice.path.display()
         );
         std::process::exit(1);
     }
-    eprintln!("AndroidFS server listening on 127.0.0.1:12345");
-    eprintln!("AndroidFS server root: {}", root.display());
+    let hello = build_hello(&config, &choice);
+    eprintln!(
+        "AndroidFS server: uid {}, root {}, entries {:?}{}",
+        hello.uid,
+        hello.root,
+        hello.root_entries,
+        choice
+            .note
+            .as_ref()
+            .map(|note| format!(" ({note})"))
+            .unwrap_or_default()
+    );
 
-    let listener = match TcpListener::bind("127.0.0.1:12345") {
+    let listener = match TcpListener::bind(("127.0.0.1", config.port)) {
         Ok(listener) => listener,
         Err(err) => {
-            eprintln!("AndroidFS server: failed to bind 127.0.0.1:12345: {err}");
+            eprintln!(
+                "AndroidFS server: failed to bind 127.0.0.1:{}: {err}",
+                config.port
+            );
             std::process::exit(1);
         }
     };
-    let (mut client, _) = match listener.accept() {
-        Ok(pair) => pair,
-        Err(err) => {
-            eprintln!("AndroidFS server: accept failed: {err}");
-            std::process::exit(1);
-        }
-    };
+    eprintln!("AndroidFS server listening on 127.0.0.1:{}", config.port);
 
-    let mut service = FsService::new(root);
     loop {
-        if let Err(err) = serve_one(&mut client, &mut service) {
-            if err.kind() != std::io::ErrorKind::UnexpectedEof {
-                eprintln!("AndroidFS server: {err}");
-            } else {
-                eprintln!("AndroidFS server: client disconnected");
+        let (mut client, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("AndroidFS server: accept failed: {err}");
+                std::process::exit(1);
             }
-            return;
+        };
+        let mut service = FsService::new(choice.path.clone());
+        match serve_session(&mut client, &mut service, &hello) {
+            // A connection that closed before sending anything is just a probe
+            // (adb forward health check, port scan). Keep waiting for the real one.
+            SessionEnd::Probe => continue,
+            SessionEnd::Finished => {
+                eprintln!("AndroidFS server: client disconnected");
+                return;
+            }
+            SessionEnd::Failed(err) => {
+                eprintln!("AndroidFS server: {err}");
+                return;
+            }
         }
     }
 }
 
-fn serve_one(client: &mut TcpStream, service: &mut FsService) -> std::io::Result<()> {
+enum SessionEnd {
+    Probe,
+    Finished,
+    Failed(std::io::Error),
+}
+
+fn serve_session(
+    client: &mut TcpStream,
+    service: &mut FsService,
+    hello: &responses::Hello,
+) -> SessionEnd {
+    let mut served = 0u64;
+    loop {
+        match serve_one(client, service, hello) {
+            Ok(()) => served += 1,
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return if served == 0 {
+                    SessionEnd::Probe
+                } else {
+                    SessionEnd::Finished
+                };
+            }
+            Err(err) => {
+                return if served == 0 {
+                    SessionEnd::Probe
+                } else {
+                    SessionEnd::Failed(err)
+                };
+            }
+        }
+    }
+}
+
+fn serve_one(
+    client: &mut TcpStream,
+    service: &mut FsService,
+    hello: &responses::Hello,
+) -> std::io::Result<()> {
     let length = client.read_u64::<BigEndian>()?;
     if length > MAX_FRAME {
         return Err(std::io::Error::new(
@@ -79,6 +198,7 @@ fn serve_one(client: &mut TcpStream, service: &mut FsService) -> std::io::Result
         requests::Request::Close(handle) => write_response(client, service.close(handle))?,
         requests::Request::Move(req) => write_response(client, service.move_file(&req))?,
         requests::Request::GetFreeSpace => write_response(client, service.free_space())?,
+        requests::Request::Hello => write_response(client, Ok(hello.clone()))?,
         requests::Request::SetEndOfFile(req) => {
             write_response(client, service.set_end_of_file(req.handle, req.len))?
         }
@@ -118,7 +238,7 @@ mod framing_tests {
 
     use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
-    use super::serve_one;
+    use super::{build_hello, serve_one, Config};
     use crate::fs_ops::FsService;
     use crate::requests::{self, Request};
     use crate::responses;
@@ -144,8 +264,16 @@ mod framing_tests {
         let root_for_server = root.clone();
         std::thread::spawn(move || {
             let (mut client, _) = listener.accept().unwrap();
-            let mut service = FsService::new(root_for_server);
-            while serve_one(&mut client, &mut service).is_ok() {}
+            let mut service = FsService::new(root_for_server.clone());
+            let hello = build_hello(
+                &Config {
+                    root: Some(root_for_server.clone()),
+                    token: "tok".into(),
+                    port: 0,
+                },
+                &FsService::choose_root(Some(&root_for_server)),
+            );
+            while serve_one(&mut client, &mut service, &hello).is_ok() {}
         });
 
         std::thread::sleep(Duration::from_millis(50));
@@ -205,6 +333,96 @@ mod framing_tests {
         stream.read_exact(&mut data).unwrap();
         assert_eq!(data, payload);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+
+    use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+
+    use super::{build_hello, parse_args, serve_session, Config, SessionEnd};
+    use crate::fs_ops::FsService;
+    use crate::requests::Request;
+    use crate::responses;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_command_line() {
+        let config = parse_args(&args(&["--token", "abc", "--root", "/storage/My Disk"]));
+        assert_eq!(config.token, "abc");
+        assert_eq!(config.root.as_deref(), Some(std::path::Path::new("/storage/My Disk")));
+        assert_eq!(config.port, 12345);
+
+        let legacy = parse_args(&args(&["/sdcard"]));
+        assert_eq!(legacy.root.as_deref(), Some(std::path::Path::new("/sdcard")));
+
+        let empty = parse_args(&args(&["--root", "  ", "--port", "4000"]));
+        assert!(empty.root.is_none());
+        assert_eq!(empty.port, 4000);
+    }
+
+    #[test]
+    fn probe_connection_does_not_stop_the_daemon() {
+        let root = std::env::temp_dir().join(format!("androidfs-hello-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel();
+        let root_for_server = root.clone();
+        std::thread::spawn(move || {
+            let config = Config {
+                root: Some(root_for_server.clone()),
+                token: "secret".into(),
+                port,
+            };
+            let choice = FsService::choose_root(config.root.as_deref());
+            let hello = build_hello(&config, &choice);
+            for _ in 0..2 {
+                let (mut client, _) = listener.accept().unwrap();
+                let mut service = FsService::new(choice.path.clone());
+                let outcome = match serve_session(&mut client, &mut service, &hello) {
+                    SessionEnd::Probe => "probe",
+                    SessionEnd::Finished => "finished",
+                    SessionEnd::Failed(_) => "failed",
+                };
+                tx.send(outcome).unwrap();
+            }
+        });
+
+        // 1) a connection that sends nothing, like adb probing the forward
+        drop(TcpStream::connect(("127.0.0.1", port)).unwrap());
+        assert_eq!(rx.recv().unwrap(), "probe");
+
+        // 2) the real session starts with Hello
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let encoded = bincode::serialize(&Request::Hello).unwrap();
+        stream.write_u64::<BigEndian>(encoded.len() as u64).unwrap();
+        stream.write_all(&encoded).unwrap();
+        let length = stream.read_u64::<BigEndian>().unwrap() as usize;
+        let mut buf = vec![0u8; length];
+        stream.read_exact(&mut buf).unwrap();
+        let hello: responses::Result<responses::Hello> = bincode::deserialize(&buf).unwrap();
+        let hello = hello.unwrap();
+        assert_eq!(hello.token, "secret");
+        assert_eq!(hello.protocol, responses::PROTOCOL_VERSION);
+        assert_eq!(hello.root, root.to_string_lossy());
+        assert_eq!(hello.root_entries, Some(2));
+        assert!(!hello.root_fallback);
+        assert!(hello.note.is_none());
+
+        drop(stream);
+        assert_eq!(rx.recv().unwrap(), "finished");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -82,6 +82,18 @@ Command-line options for `androidfs_driver.exe`:
 |--------|--------|
 | `--background` | Start minimized (used by autostart) |
 
+## Root and non-root phones
+
+Settings > *Access on the phone*:
+
+| Mode | Behaviour |
+|------|-----------|
+| Automatic (default) | Starts as the ADB `shell` user. If that user cannot read the chosen folder and the phone is rooted, the daemon is restarted through `su` automatically. |
+| Without root | Never uses `su`. Works on every phone, limited to what `shell` may read (shared storage, `/storage`, most of `/`). |
+| Root (su) | Always starts through `su` (Magisk, SuperSU, KernelSU, `su 0`, `su root`; also phones where adbd already runs as root). Needed for `/data`. Approve the request on the phone. |
+
+The device list shows the mode in use and the folder that is mounted. Quick buttons next to *Drive root* select shared storage, `/`, `/storage` or `/data`.
+
 ## Building from source
 
 Prerequisites: nightly Rust with `rust-src` (the Windows app is built for `x86_64-win7-windows-msvc`, so it also runs on Windows 7), [cargo-ndk](https://github.com/bbqsrc/cargo-ndk), the Android NDK (`ANDROID_NDK_HOME` set), Dokan 1.5.x with its development files, and the Windows SDK.
@@ -147,6 +159,7 @@ Open the **Log** tab, or `%APPDATA%\AndroidFS-F\androidfs.log`, for details.
 - Fixed a panic on reads past the end of a file and wrong status codes for missing files.
 - The drive root is the phone's shared storage; ADB failures no longer stop the application.
 - Symbolic links to directories are shown as directories.
+- 0.4.0: fixed the drive mounting but looking empty (the host connected through `adb forward` before the daemon was listening; a `Hello` handshake with a token is now required), folders no longer carry cloud-placeholder flags, one over-long name no longer aborts a listing, `adb forward --no-rebind`, root / non-root access modes, and a post-mount self-check in the log.
 
 ## License
 

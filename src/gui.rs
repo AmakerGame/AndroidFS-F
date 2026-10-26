@@ -8,6 +8,7 @@ use log::{error, info, LevelFilter};
 use widestring::U16CString;
 use winapi::um::winuser::{MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST};
 
+use crate::daemon_cmd::AccessMode;
 use crate::service::{self, Command, DeviceEntry, DeviceState, SharedState};
 use crate::settings::{self, Settings};
 
@@ -60,7 +61,7 @@ impl App {
         if !self.form.root.trim().is_empty() && !service::is_safe_android_path(&self.form.root) {
             self.note = Some((
                 false,
-                "Root directory must be an absolute Android path using only letters, digits, / _ . -"
+                "Root directory must be an absolute Android path (letters, digits, spaces and / _ . - + @ ( ) , = ~)"
                     .to_string(),
             ));
             return;
@@ -142,6 +143,35 @@ impl App {
                             };
                             ui.label(egui::RichText::new(name).strong());
                             ui.label(egui::RichText::new(device.serial.as_str()).monospace().color(MUTED));
+                            if let Some(info) = &device.info {
+                                ui.label(
+                                    egui::RichText::new(format!("{} - {}", info.access, info.root_dir))
+                                        .small()
+                                        .color(if info.entries.is_none() { WARN } else { MUTED }),
+                                );
+                                match info.entries {
+                                    Some(0) => {
+                                        ui.label(
+                                            egui::RichText::new("The folder is empty on the phone")
+                                                .small()
+                                                .color(WARN),
+                                        );
+                                    }
+                                    None => {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Folder not readable - set access mode to Root in Settings",
+                                            )
+                                            .small()
+                                            .color(WARN),
+                                        );
+                                    }
+                                    Some(_) => {}
+                                }
+                                if let Some(note) = &info.note {
+                                    ui.label(egui::RichText::new(note.as_str()).small().color(WARN));
+                                }
+                            }
                         });
                         ui.label(if device.abi.is_empty() { "-" } else { device.abi.as_str() });
                         state_label(ui, &device.state);
@@ -205,15 +235,56 @@ impl App {
         ui.add_space(8.0);
 
         ui.group(|ui| {
+            ui.label(egui::RichText::new("Access on the phone").strong());
+            ui.radio_value(
+                &mut self.form.access_mode,
+                AccessMode::Auto,
+                "Automatic - without root, switch to root only if the folder cannot be read",
+            );
+            ui.radio_value(
+                &mut self.form.access_mode,
+                AccessMode::Shell,
+                "Without root - works on every phone, limited to what the ADB shell may read",
+            );
+            ui.radio_value(
+                &mut self.form.access_mode,
+                AccessMode::Root,
+                "Root (su) - full access on rooted phones; approve the request on the phone",
+            );
+            ui.label(
+                egui::RichText::new("Applies the next time a device is mounted (Unmount, then Mount).")
+                    .color(MUTED),
+            );
+        });
+        ui.add_space(8.0);
+
+        ui.group(|ui| {
             ui.label(egui::RichText::new("Drive root on the phone").strong());
             ui.label("Android directory shown as the drive (leave empty for shared storage):");
             ui.add(
                 egui::TextEdit::singleline(&mut self.form.root)
-                    .hint_text("/storage/emulated/0")
+                    .hint_text("Shared storage (auto-detected)")
                     .desired_width(f32::INFINITY),
             );
+            ui.horizontal(|ui| {
+                if ui.small_button("Shared storage").clicked() {
+                    self.form.root.clear();
+                }
+                if ui.small_button("Whole device (/)").clicked() {
+                    self.form.root = "/".to_string();
+                }
+                if ui.small_button("All storages (/storage)").clicked() {
+                    self.form.root = "/storage".to_string();
+                }
+                if ui.small_button("App data (/data)").clicked() {
+                    self.form.root = "/data".to_string();
+                }
+            });
             ui.label(
-                egui::RichText::new("Applies the next time a device is mounted.").color(MUTED),
+                egui::RichText::new(
+                    "/data and most of / need root. Spaces in the path are allowed.",
+                )
+                .color(MUTED),
             );
         });
         ui.add_space(10.0);
@@ -268,7 +339,7 @@ impl App {
         ui.add_space(8.0);
         ui.label("Fork of AndroidFS by Lauriethefish. Licensed under GPL-3.0.");
         ui.add_space(8.0);
-        ui.label("Supported devices: arm64-v8a and armeabi-v7a, USB debugging enabled.");
+        ui.label("Supported devices: arm64-v8a and armeabi-v7a, USB debugging enabled. Works with and without root.");
         ui.add_space(12.0);
         if ui.button("Open project page").clicked() {
             open_in_shell(REPO_URL);

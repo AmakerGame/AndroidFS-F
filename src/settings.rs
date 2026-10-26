@@ -4,6 +4,8 @@ use std::process::Command;
 
 use winapi::um::winbase::CREATE_NO_WINDOW;
 
+use crate::daemon_cmd::AccessMode;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub auto_mount: bool,
@@ -11,6 +13,8 @@ pub struct Settings {
     pub root: String,
     /// Custom adb.exe path. Empty = auto-detect.
     pub adb_path: String,
+    /// Auto: shell first, root only when needed. Shell: never root. Root: always `su`.
+    pub access_mode: AccessMode,
 }
 
 impl Default for Settings {
@@ -19,6 +23,7 @@ impl Default for Settings {
             auto_mount: true,
             root: String::new(),
             adb_path: String::new(),
+            access_mode: AccessMode::Auto,
         }
     }
 }
@@ -52,6 +57,7 @@ pub fn load() -> Settings {
             "auto_mount" => settings.auto_mount = value != "false",
             "root" => settings.root = value.to_string(),
             "adb_path" => settings.adb_path = value.to_string(),
+            "access_mode" => settings.access_mode = AccessMode::parse(value),
             _ => {}
         }
     }
@@ -61,10 +67,11 @@ pub fn load() -> Settings {
 pub fn save(settings: &Settings) -> std::io::Result<()> {
     std::fs::create_dir_all(data_dir())?;
     let text = format!(
-        "auto_mount={}\nroot={}\nadb_path={}\n",
+        "auto_mount={}\nroot={}\nadb_path={}\naccess_mode={}\n",
         settings.auto_mount,
         settings.root.trim(),
-        settings.adb_path.trim()
+        settings.adb_path.trim(),
+        settings.access_mode.as_str()
     );
     std::fs::write(settings_path(), text)
 }
