@@ -230,6 +230,19 @@ impl Client {
         }))
     }
 
+    pub fn set_times(
+        &self,
+        path: &str,
+        accessed: Option<std::time::SystemTime>,
+        modified: Option<std::time::SystemTime>,
+    ) -> Result<()> {
+        self.send(requests::Request::SetTimes(requests::SetTimes {
+            path: path.to_string(),
+            accessed,
+            modified,
+        }))
+    }
+
     pub fn stat_file(&self, path: &str) -> Result<responses::StatFile> {
         self.send(requests::Request::Stat(path.to_string()))
     }

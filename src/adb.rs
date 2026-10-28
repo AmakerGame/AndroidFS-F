@@ -159,16 +159,29 @@ impl DebugBridge {
         }
     }
 
-    pub fn get_devices(&self) -> std::result::Result<Vec<Device>, Error> {
+    /// Usable devices plus the ones adb lists but cannot use yet (unauthorized, offline).
+    pub fn list_devices(
+        &self,
+    ) -> std::result::Result<(Vec<Device>, Vec<(String, String)>), Error> {
         let output = self.invoke_result(vec!["devices".to_string()])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(adb_parse::parse_device_serials(&stdout)
+        let devices = adb_parse::parse_device_serials(&stdout)
             .into_iter()
             .map(|serial_number| Device {
                 debug_bridge: self.clone(),
                 serial_number,
             })
-            .collect())
+            .collect();
+        Ok((devices, adb_parse::parse_problem_devices(&stdout)))
+    }
+
+    /// Runs an adb command with a time limit (`adb connect` to a dead host can hang).
+    pub fn invoke_timeout(
+        &self,
+        args: Vec<String>,
+        timeout: Duration,
+    ) -> std::result::Result<Output, Error> {
+        run_with_timeout(&self.adb_path, &args, timeout)
     }
 }
 

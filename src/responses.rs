@@ -5,7 +5,7 @@ use crate::models::FileInfo;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Bumped whenever the wire protocol changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 pub type ListFiles = Vec<FileInfo>;
 pub type StatFile = FileInfo;

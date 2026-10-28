@@ -397,13 +397,28 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for QuestFsHandler {
 
     fn set_file_time(
         &'b self,
-        _file_name: &U16CStr,
+        file_name: &U16CStr,
         _creation_time: FileTimeInfo,
-        _last_access_time: FileTimeInfo,
-        _last_write_time: FileTimeInfo,
+        last_access_time: FileTimeInfo,
+        last_write_time: FileTimeInfo,
         _info: &OperationInfo<'a, 'b, Self>,
         _context: &'a Self::Context,
     ) -> Result<(), OperationError> {
+        // Keep the original dates of copied files (photos, documents). A
+        // failure here is only logged: it must not abort a copy.
+        let pick = |time: FileTimeInfo| match time {
+            FileTimeInfo::SetTime(time) => Some(time),
+            _ => None,
+        };
+        let (accessed, modified) = (pick(last_access_time), pick(last_write_time));
+        if accessed.is_none() && modified.is_none() {
+            return Ok(());
+        }
+        let path = convert_file_name(file_name);
+        match self.client.set_times(&path, accessed, modified) {
+            Ok(()) => self.invalidate(&path),
+            Err(err) => error!("could not set times for {path}: {err}"),
+        }
         Ok(())
     }
 

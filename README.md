@@ -94,6 +94,19 @@ Settings > *Access on the phone*:
 
 Each device in the **Devices** tab has its own *Access for this device* section (mode and folder), stored per serial; it overrides the global setting. With root and no folder chosen, the whole device (`/`) is shown instead of only shared storage. The device list shows the mode in use and the folder that is mounted. Quick buttons next to *Drive root* select shared storage, `/`, `/storage` or `/data`.
 
+## More features
+
+- **Network devices:** type `ip` or `ip:port` in *Network device* and press Connect (`adb connect`). Addresses are remembered and reconnected automatically; *Forget* removes one.
+- **Read-only mode:** global default in Settings, or per device. Windows then cannot write, rename or delete anything on the phone.
+- **File dates are preserved** when copying to the phone (modification and access times), so photos keep their order in the gallery.
+- **Clear hints** for devices adb sees but cannot use (*unauthorized*, *offline*).
+- **Retry back-off:** a device that fails to mount is retried after 15 s, 30 s, 1 min ... up to 5 min.
+- **Stable drive letters:** each device keeps its letter between runs; pick another per device (*Access for this device*).
+- **SD card / USB drive as the drive root** (`SD / USB` button, value `@external`): the first removable storage under `/storage`, handy for TV boxes.
+- **Open adb shell** for a device in one click, and **Copy diagnostics** in the Log tab for bug reports.
+- The log rolls over at 2 MB, and unreachable saved network hosts are retried in the background without delaying mounts.
+- **Correct free space** is reported when the drive root is `/` or `/storage`, so Windows no longer refuses to copy because the root file system looks full.
+
 ## Building from source
 
 Prerequisites: nightly Rust with `rust-src` (the Windows app is built for `x86_64-win7-windows-msvc`, so it also runs on Windows 7), [cargo-ndk](https://github.com/bbqsrc/cargo-ndk), the Android NDK (`ANDROID_NDK_HOME` set), Dokan 1.5.x with its development files, and the Windows SDK.

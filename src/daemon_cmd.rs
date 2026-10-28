@@ -100,6 +100,15 @@ pub fn is_safe_android_path(path: &str) -> bool {
         && !path.split('/').any(|part| part == "..")
 }
 
+/// Special drive-root value: the first SD card / USB drive found under `/storage`.
+pub const EXTERNAL_ROOT: &str = "@external";
+
+/// A drive-root setting that may be passed to the daemon.
+pub fn is_valid_root_setting(value: &str) -> bool {
+    let value = value.trim();
+    value == EXTERNAL_ROOT || is_safe_android_path(value)
+}
+
 /// POSIX single-quote quoting: `it's` becomes `'it'\''s'`.
 pub fn sh_quote(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
@@ -155,6 +164,41 @@ pub fn parse_uid(output: &str) -> Option<u32> {
     }
 }
 
+/// Turns user input like `192.168.0.5` into `192.168.0.5:5555`; rejects anything
+/// that is not a plain host name or address with an optional port.
+pub fn normalize_adb_host(input: &str) -> Option<String> {
+    let text = input.trim();
+    if text.is_empty()
+        || text.len() > 64
+        || !text
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | ':' | '-' | '_'))
+    {
+        return None;
+    }
+    match text.matches(':').count() {
+        0 => Some(format!("{text}:5555")),
+        1 => {
+            let (host, port) = text.split_once(':')?;
+            if host.is_empty() || port.parse::<u16>().ok()? == 0 {
+                None
+            } else {
+                Some(text.to_string())
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `adb connect` exits with 0 even when it fails; only its text tells.
+pub fn connect_succeeded(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    (lower.contains("connected to") || lower.contains("already connected"))
+        && !lower.contains("failed")
+        && !lower.contains("cannot")
+        && !lower.contains("unable")
+}
+
 /// A short random hex token so the host can recognise the daemon it started
 /// (and not a stale one that is still bound to the port).
 pub fn make_token() -> String {
@@ -181,6 +225,13 @@ mod tests {
         assert!(!is_safe_android_path("/sdcard/it's"));
         assert!(!is_safe_android_path("/sdcard/`id`"));
         assert!(!is_safe_android_path("/sdcard/../data"));
+    }
+
+    #[test]
+    fn root_settings() {
+        assert!(is_valid_root_setting("@external"));
+        assert!(is_valid_root_setting("/storage/emulated/0"));
+        assert!(!is_valid_root_setting("@other"));
     }
 
     #[test]
@@ -254,6 +305,20 @@ mod tests {
         let token = make_token();
         assert_eq!(token.len(), 16);
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn adb_hosts() {
+        assert_eq!(normalize_adb_host("192.168.0.5").as_deref(), Some("192.168.0.5:5555"));
+        assert_eq!(normalize_adb_host(" box.local:6000 ").as_deref(), Some("box.local:6000"));
+        assert_eq!(normalize_adb_host("a:b:c"), None);
+        assert_eq!(normalize_adb_host("1.2.3.4:0"), None);
+        assert_eq!(normalize_adb_host("1.2.3.4; rm"), None);
+        assert_eq!(normalize_adb_host(""), None);
+        assert!(connect_succeeded("connected to 192.168.0.5:5555"));
+        assert!(connect_succeeded("already connected to 192.168.0.5:5555\r\n"));
+        assert!(!connect_succeeded("failed to connect to '192.168.0.5:5555': Connection refused"));
+        assert!(!connect_succeeded("cannot connect to 1.2.3.4:5555: timed out (10060)"));
     }
 
     #[test]

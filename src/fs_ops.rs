@@ -92,7 +92,44 @@ impl FsService {
     /// Picks the folder to serve. `requested` is what the user configured
     /// (`None` = auto-detect). An unreadable request falls back to detection and
     /// says so, so the host can retry as root or tell the user what happened.
+    /// First SD card or USB drive in `dir` (normally `/storage`): a readable
+    /// folder that is not the internal storage or one of its aliases.
+    pub fn find_removable_in(dir: &Path) -> Option<PathBuf> {
+        let mut found: Vec<PathBuf> = fs::read_dir(dir)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                !name.is_empty()
+                    && !name.starts_with('.')
+                    && !matches!(name, "emulated" | "self" | "sdcard0" | "knox-emulated")
+                    && path.is_dir()
+                    && can_list(path)
+            })
+            .collect();
+        found.sort();
+        found.into_iter().next()
+    }
+
     pub fn choose_root(requested: Option<&Path>) -> RootChoice {
+        if requested == Some(Path::new(crate::daemon_cmd::EXTERNAL_ROOT)) {
+            return match Self::find_removable_in(Path::new("/storage")) {
+                Some(path) => RootChoice {
+                    path,
+                    fallback: false,
+                    note: None,
+                },
+                None => {
+                    let path = Self::detect_root();
+                    RootChoice {
+                        path,
+                        fallback: true,
+                        note: Some("no SD card or USB drive found; showing internal storage".into()),
+                    }
+                }
+            };
+        }
         if let Some(requested) = requested {
             return match fs::read_dir(requested) {
                 Ok(_) => RootChoice {
@@ -388,10 +425,60 @@ impl FsService {
     }
 
     pub fn free_space(&self) -> responses::Result<responses::FreeSpace> {
-        disk_space(&self.root)
-            .or_else(|| disk_space(Path::new("/storage/emulated/0")))
-            .or_else(|| disk_space(Path::new("/")))
+        // The root of the drive may be `/` or `/storage` (a tiny read-only or
+        // tmpfs mount). Reporting that would make Windows believe the drive is
+        // full and refuse every copy, so measure the real storage instead.
+        let tiny_root = matches!(self.root.to_str(), Some("/" | "/storage" | "/mnt"));
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if !tiny_root {
+            candidates.push(self.root.clone());
+        }
+        candidates.extend(ROOT_CANDIDATES.iter().map(PathBuf::from));
+        candidates.push(PathBuf::from("/data"));
+        candidates.push(self.root.clone());
+        candidates
+            .iter()
+            .find_map(|path| disk_space(path))
             .ok_or(Error::CouldNotFindDisk)
+    }
+
+    pub fn set_times(&self, req: &requests::SetTimes) -> responses::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = self.resolve(&req.path)?;
+        if path == self.root {
+            return Ok(());
+        }
+        let to_timespec = |time: Option<SystemTime>| match time {
+            None => libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT as _,
+            },
+            Some(time) => {
+                let since = time
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default();
+                libc::timespec {
+                    tv_sec: since.as_secs() as _,
+                    tv_nsec: since.subsec_nanos() as _,
+                }
+            }
+        };
+        let times = [to_timespec(req.accessed), to_timespec(req.modified)];
+        let mut bytes = path.as_os_str().as_bytes().to_vec();
+        bytes.push(0);
+        let result = unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                bytes.as_ptr() as *const libc::c_char,
+                times.as_ptr(),
+                0,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(to_response_error(std::io::Error::last_os_error()))
+        }
     }
 }
 
@@ -605,6 +692,19 @@ mod tests {
     }
 
     #[test]
+    fn finds_removable_storage() {
+        let dir = temp_root();
+        for name in ["emulated", "self", "1A2B-3C4D", "sdcard0"] {
+            fs::create_dir(dir.join(name)).unwrap();
+        }
+        assert_eq!(FsService::find_removable_in(&dir), Some(dir.join("1A2B-3C4D")));
+        let empty = temp_root();
+        assert_eq!(FsService::find_removable_in(&empty), None);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&empty);
+    }
+
+    #[test]
     fn unreadable_root_falls_back_with_a_note() {
         let root = temp_root();
         let ok = FsService::choose_root(Some(&root));
@@ -637,5 +737,28 @@ mod tests {
         assert_eq!(names, vec!["dir", "file.txt", "link-to-dir"]);
         assert_eq!(count_entries(&root), Some(4));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_times_changes_modification_time() {
+        let root = temp_root();
+        fs::write(root.join("photo.jpg"), b"x").unwrap();
+        let svc = FsService::new(root.clone());
+        let when = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_400_000_000);
+        svc.set_times(&requests::SetTimes {
+            path: "/photo.jpg".into(),
+            accessed: None,
+            modified: Some(when),
+        })
+        .unwrap();
+        let info = svc.stat_file("/photo.jpg").unwrap();
+        assert_eq!(info.last_modified, when);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn free_space_ignores_tiny_root() {
+        let svc = FsService::new(PathBuf::from("/"));
+        assert!(svc.free_space().unwrap().total_bytes > 0);
     }
 }

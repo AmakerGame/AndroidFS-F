@@ -34,6 +34,7 @@ struct App {
     autostart: bool,
     note: Option<(bool, String)>,
     minimize_on_start: bool,
+    connect_text: String,
 }
 
 impl App {
@@ -46,6 +47,7 @@ impl App {
             autostart: settings::autostart_enabled(),
             note: None,
             minimize_on_start,
+            connect_text: String::new(),
         }
     }
 
@@ -58,7 +60,7 @@ impl App {
     }
 
     fn apply_form(&mut self) {
-        if !self.form.root.trim().is_empty() && !service::is_safe_android_path(&self.form.root) {
+        if !self.form.root.trim().is_empty() && !crate::daemon_cmd::is_valid_root_setting(&self.form.root) {
             self.note = Some((
                 false,
                 "Root directory must be an absolute Android path (letters, digits, spaces and / _ . - + @ ( ) , = ~)"
@@ -99,6 +101,19 @@ impl App {
             Some(AccessMode::Root) => "Root (su)",
         };
         ui.collapsing("Access for this device", |ui| {
+            if ui.small_button("Open adb shell").clicked() {
+                let adb = service::lock(&self.shared).adb_path_in_use.clone();
+                open_adb_shell(&adb, serial);
+            }
+            let letter_text = entry.letter.clone().unwrap_or_else(|| "Automatic".to_string());
+            egui::ComboBox::from_id_source(format!("letter_{serial}"))
+                .selected_text(format!("Drive letter: {letter_text}"))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut entry.letter, None, "Automatic");
+                    for letter in service::MOUNT_POINTS {
+                        ui.selectable_value(&mut entry.letter, Some(letter.to_string()), *letter);
+                    }
+                });
             egui::ComboBox::from_id_source(format!("access_{serial}"))
                 .selected_text(current)
                 .show_ui(ui, |ui| {
@@ -107,6 +122,13 @@ impl App {
                     ui.selectable_value(&mut entry.access_mode, Some(AccessMode::Shell), "Without root");
                     ui.selectable_value(&mut entry.access_mode, Some(AccessMode::Root), "Root (su)");
                 });
+            let mut read_only = entry.read_only.unwrap_or(self.form.read_only);
+            if ui
+                .checkbox(&mut read_only, "Read-only (Windows cannot change this device)")
+                .changed()
+            {
+                entry.read_only = Some(read_only);
+            }
             let mut root = entry.root.clone().unwrap_or_default();
             ui.add(
                 egui::TextEdit::singleline(&mut root)
@@ -120,6 +142,9 @@ impl App {
                 }
                 if ui.small_button("Storage").clicked() {
                     root = "/storage/emulated/0".to_string();
+                }
+                if ui.small_button("SD / USB").clicked() {
+                    root = "@external".to_string();
                 }
                 if ui.small_button("/").clicked() {
                     root = "/".to_string();
@@ -137,7 +162,7 @@ impl App {
                     .color(MUTED),
             );
         });
-        let valid = entry.root.as_deref().map_or(true, |r| r.trim().is_empty() || service::is_safe_android_path(r));
+        let valid = entry.root.as_deref().map_or(true, |r| r.trim().is_empty() || crate::daemon_cmd::is_valid_root_setting(r));
         if entry != before && valid {
             if entry == DeviceSetting::default() {
                 self.form.per_device.remove(serial);
@@ -182,6 +207,46 @@ impl App {
             ui.add_space(6.0);
         }
 
+        let applied_now = self.applied();
+        let hosts = applied_now.hosts.clone();
+        self.form.hosts = hosts.clone();
+        self.form.per_device = applied_now.per_device.clone();
+        ui.horizontal(|ui| {
+            ui.label("Network device:");
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.connect_text)
+                    .hint_text("192.168.0.50 or 192.168.0.50:5555")
+                    .desired_width(230.0),
+            );
+            let enter = response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if (ui.button("Connect").clicked() || enter) && !self.connect_text.trim().is_empty() {
+                self.send(Command::Connect(self.connect_text.trim().to_string()));
+                self.connect_text.clear();
+            }
+        });
+        for host in &hosts {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("Saved: {host}")).small().color(MUTED));
+                if ui.small_button("Forget").clicked() {
+                    self.send(Command::Forget(host.clone()));
+                }
+            });
+        }
+        let problems = service::lock(&self.shared).problems.clone();
+        for (serial, state) in &problems {
+            let hint = match state.as_str() {
+                "unauthorized" => "Unlock the phone and tap Allow on the USB debugging prompt (tick Always allow).",
+                "authorizing" => "Waiting for the USB debugging prompt on the phone.",
+                _ => "Offline: re-plug the cable, toggle USB debugging, or run adb kill-server.",
+            };
+            ui.label(
+                egui::RichText::new(format!("{serial} - {state}. {hint}"))
+                    .small()
+                    .color(WARN),
+            );
+        }
+        ui.add_space(6.0);
+
         if devices.is_empty() {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
@@ -220,7 +285,12 @@ impl App {
                             ui.label(egui::RichText::new(device.serial.as_str()).monospace().color(MUTED));
                             if let Some(info) = &device.info {
                                 ui.label(
-                                    egui::RichText::new(format!("{} - {}", info.access, info.root_dir))
+                                    egui::RichText::new(format!(
+                                        "{} - {}{}",
+                                        info.access,
+                                        info.root_dir,
+                                        if info.read_only { " (read-only)" } else { "" }
+                                    ))
                                         .small()
                                         .color(if info.entries.is_none() { WARN } else { MUTED }),
                                 );
@@ -277,12 +347,18 @@ impl App {
 
     fn settings_tab(&mut self, ui: &mut egui::Ui, adb_in_use: &str) {
         let applied = self.applied();
+        self.form.hosts = applied.hosts.clone();
+        self.form.per_device = applied.per_device.clone();
         ui.heading("Settings");
         ui.add_space(8.0);
 
         ui.group(|ui| {
             ui.label(egui::RichText::new("General").strong());
             ui.checkbox(&mut self.form.auto_mount, "Mount devices automatically when connected");
+            ui.checkbox(
+                &mut self.form.read_only,
+                "Mount read-only by default (protects the phone from accidental changes)",
+            );
             let mut autostart = self.autostart;
             if ui.checkbox(&mut autostart, "Start with Windows (minimized)").changed() {
                 match settings::set_autostart(autostart) {
@@ -349,6 +425,9 @@ impl App {
                 if ui.small_button("Whole device (/)").clicked() {
                     self.form.root = "/".to_string();
                 }
+                if ui.small_button("SD / USB drive").clicked() {
+                    self.form.root = "@external".to_string();
+                }
                 if ui.small_button("All storages (/storage)").clicked() {
                     self.form.root = "/storage".to_string();
                 }
@@ -386,6 +465,21 @@ impl App {
         ui.horizontal(|ui| {
             if ui.button("Copy").clicked() {
                 let text = lines.join("\n");
+                ui.output_mut(|out| out.copied_text = text);
+            }
+            if ui.button("Copy diagnostics").clicked() {
+                let guard = service::lock(&self.shared);
+                let mut text = format!(
+                    "AndroidFS-F {}\nadb: {}\nsettings: {:?}\n",
+                    env!("CARGO_PKG_VERSION"),
+                    guard.adb_path_in_use,
+                    guard.settings
+                );
+                for device in &guard.devices {
+                    text.push_str(&format!("device {}: {:?} abi={} info={:?}\n", device.serial, device.state, device.abi, device.info));
+                }
+                text.push_str(&format!("problems: {:?}\n--- log ---\n{}", guard.problems, lines.join("\n")));
+                drop(guard);
                 ui.output_mut(|out| out.copied_text = text);
             }
             if ui.button("Clear").clicked() {
@@ -448,6 +542,18 @@ fn state_label(ui: &mut egui::Ui, state: &DeviceState) {
                 .on_hover_text(message.clone());
         }
     }
+}
+
+/// Opens a console with `adb -s <serial> shell` for this device.
+fn open_adb_shell(adb: &str, serial: &str) {
+    use std::os::windows::process::CommandExt;
+    let plain = |text: &str| text.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '_'));
+    if !plain(serial) || adb.contains('"') {
+        return;
+    }
+    let _ = std::process::Command::new("cmd")
+        .raw_arg(format!("/C start \"adb {serial}\" cmd /K \"\"{adb}\" -s {serial} shell\""))
+        .spawn();
 }
 
 fn open_in_shell(target: &str) {
@@ -535,6 +641,10 @@ fn init_logging() {
         builder.filter_level(LevelFilter::Info);
     }
     let _ = std::fs::create_dir_all(settings::data_dir());
+    // Keep the log from growing forever: roll it over at 2 MB.
+    if std::fs::metadata(settings::log_path()).map(|m| m.len() > 2 * 1024 * 1024).unwrap_or(false) {
+        let _ = std::fs::rename(settings::log_path(), settings::log_path().with_extension("log.old"));
+    }
     if let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

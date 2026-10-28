@@ -19,6 +19,8 @@ pub enum Request {
     /// Handshake: asks the daemon who it is (token, user id, drive root).
     /// Appended last so the wire format of the other requests is unchanged.
     Hello,
+    /// Sets access/modification times (keeps file dates when copying).
+    SetTimes(SetTimes),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -39,6 +41,14 @@ pub struct WriteFile {
 pub struct SetEndOfFile {
     pub handle: FileHandle,
     pub len: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SetTimes {
+    pub path: String,
+    /// `None` leaves the time unchanged.
+    pub accessed: Option<std::time::SystemTime>,
+    pub modified: Option<std::time::SystemTime>,
 }
 
 pub type CloseFile = FileHandle;

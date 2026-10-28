@@ -199,6 +199,7 @@ fn serve_one(
         requests::Request::Move(req) => write_response(client, service.move_file(&req))?,
         requests::Request::GetFreeSpace => write_response(client, service.free_space())?,
         requests::Request::Hello => write_response(client, Ok(hello.clone()))?,
+        requests::Request::SetTimes(req) => write_response(client, service.set_times(&req))?,
         requests::Request::SetEndOfFile(req) => {
             write_response(client, service.set_end_of_file(req.handle, req.len))?
         }

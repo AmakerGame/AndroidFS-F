@@ -24,7 +24,6 @@ use crate::file_system::QuestFsHandler;
 use crate::responses;
 use crate::settings::Settings;
 
-pub use crate::daemon_cmd::is_safe_android_path;
 
 const BASE_PORT: u16 = 15000;
 const MAX_PORT: u16 = 16000;
@@ -38,7 +37,7 @@ const SERVER_ARM64: &[u8] =
 const SERVER_ARM32: &[u8] =
     include_bytes!("../target/armv7-linux-androideabi/release/androidfs_server");
 
-const MOUNT_POINTS: &[&str] = &[
+pub const MOUNT_POINTS: &[&str] = &[
     "Q:", "R:", "S:", "T:", "U:", "V:", "W:", "X:", "Y:", "Z:", "D:", "E:", "F:", "G:", "H:", "I:",
     "J:", "K:", "L:", "M:", "N:", "O:", "P:",
 ];
@@ -61,6 +60,7 @@ pub struct MountInfo {
     pub root_dir: String,
     pub entries: Option<u32>,
     pub note: Option<String>,
+    pub read_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +75,8 @@ pub struct DeviceEntry {
     pub info: Option<MountInfo>,
     /// The `su` flavour that worked on this device (remembered to clean up root daemons).
     pub su_style: Option<SuStyle>,
+    /// Consecutive failed mounts, used to slow retries down.
+    pub failures: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +84,10 @@ pub enum Command {
     Refresh,
     Mount(String),
     Unmount(String),
+    /// `adb connect` to a network device and remember it.
+    Connect(String),
+    /// Disconnect a network device and stop reconnecting it.
+    Forget(String),
 }
 
 pub struct Shared {
@@ -91,6 +97,8 @@ pub struct Shared {
     pub adb_path_in_use: String,
     pub adb_error: Option<String>,
     pub commands: VecDeque<Command>,
+    /// Devices adb sees but cannot use: (serial, state).
+    pub problems: Vec<(String, String)>,
     reserved: HashSet<String>,
     pub quit: bool,
 }
@@ -110,6 +118,7 @@ impl Shared {
             adb_path_in_use: String::new(),
             adb_error: None,
             commands: VecDeque::new(),
+            problems: Vec::new(),
             reserved: HashSet::new(),
             quit: false,
         }
@@ -155,7 +164,18 @@ fn server_binary_for(abi: &str) -> Option<&'static [u8]> {
     }
 }
 
-fn pick_letter(reserved: &HashSet<String>) -> Option<&'static str> {
+fn pick_letter(reserved: &HashSet<String>, preferred: Option<&str>) -> Option<&'static str> {
+    let free = |letter: &str| !reserved.contains(letter) && !Path::new(&format!("{letter}\\")).exists();
+    // The same device keeps the same letter between runs.
+    if let Some(wanted) = MOUNT_POINTS
+        .iter()
+        .copied()
+        .find(|letter| Some(*letter) == preferred)
+    {
+        if free(wanted) {
+            return Some(wanted);
+        }
+    }
     MOUNT_POINTS.iter().copied().find(|letter| {
         !reserved.contains(*letter) && !Path::new(&format!("{letter}\\")).exists()
     })
@@ -359,7 +379,7 @@ fn start_daemon(
         } else {
             None
         }
-    } else if is_safe_android_path(root_setting) {
+    } else if daemon_cmd::is_valid_root_setting(root_setting) {
         Some(root_setting.trim())
     } else {
         warn!("{serial}: ignoring unsafe root {root_setting:?}");
@@ -553,15 +573,21 @@ fn setup(device: adb::Device, shared: &SharedState) -> Result<String, SetupError
         }
     }
 
-    let (letter, root, mode) = {
+    let (letter, root, mode, read_only) = {
         let mut guard = lock(shared);
-        let letter = pick_letter(&guard.reserved).ok_or(SetupError::NoAvailableDriveLetter)?;
+        let preferred = guard
+            .settings
+            .per_device
+            .get(&serial)
+            .and_then(|d| d.letter.clone());
+        let letter = pick_letter(&guard.reserved, preferred.as_deref())
+            .ok_or(SetupError::NoAvailableDriveLetter)?;
         guard.reserved.insert(letter.to_string());
-        let (mode, root) = guard.settings.effective(&serial);
-        (letter.to_string(), root, mode)
+        let eff = guard.settings.effective(&serial);
+        (letter.to_string(), eff.root, eff.access_mode, eff.read_only)
     };
 
-    let result = setup_reserved(device, shared, &letter, binary, &root, mode);
+    let result = setup_reserved(device, shared, &letter, binary, &root, mode, read_only);
     if result.is_err() {
         lock(shared).reserved.remove(&letter);
     }
@@ -620,6 +646,7 @@ fn setup_reserved(
     binary: &'static [u8],
     root_setting: &str,
     mode: AccessMode,
+    read_only: bool,
 ) -> Result<String, SetupError> {
     let port = forward_free_port(&device)?;
     debug!("Forwarded tcp:{port} -> tcp:{DAEMON_PORT}");
@@ -676,6 +703,9 @@ fn setup_reserved(
         );
     }
 
+    if read_only {
+        ui_info(shared, format!("{serial}: mounted read-only"));
+    }
     let stream = session.stream;
     let label = volume_label(&serial);
     let volume_name =
@@ -694,9 +724,13 @@ fn setup_reserved(
             let serial = serial_for_mount;
             let handler = QuestFsHandler::new(Client::new(stream), volume_name);
             let mut failure: Option<String> = None;
+            let mut flags = MountFlags::CASE_SENSITIVE;
+            if read_only {
+                flags |= MountFlags::WRITE_PROTECT;
+            }
             match Drive::new()
                 .mount_point(&mount_point)
-                .flags(MountFlags::CASE_SENSITIVE)
+                .flags(flags)
                 .thread_count(0)
                 .mount(&handler)
             {
@@ -759,8 +793,14 @@ fn setup_reserved(
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    {
+    let remembered = {
         let mut guard = lock(shared);
+        let device_setting = guard.settings.per_device.entry(serial.clone()).or_default();
+        let newly = device_setting.letter.is_none();
+        if newly {
+            device_setting.letter = Some(letter.to_string());
+        }
+        let snapshot = newly.then(|| guard.settings.clone());
         if let Some(entry) = guard.entry_mut(&serial) {
             entry.state = DeviceState::Mounted(letter.to_string());
             entry.retry_after = None;
@@ -769,8 +809,14 @@ fn setup_reserved(
                 root_dir: hello.root.clone(),
                 entries: hello.root_entries,
                 note: hello.note.clone(),
+                read_only,
             });
+            entry.failures = 0;
         }
+        snapshot
+    };
+    if let Some(settings) = remembered {
+        let _ = crate::settings::save(&settings);
     }
 
     // Self-check from the Windows side: what does Explorer's own listing see?
@@ -821,13 +867,16 @@ fn mount_now(shared: &SharedState, bridge: &adb::DebugBridge, serial: &str) {
     match setup(bridge.device(serial), shared) {
         Ok(drive) => ui_info(shared, format!("Mounted {serial} as {drive}\\")),
         Err(err) => {
-            let wait = match err {
-                SetupError::UnsupportedAbi(_) => 3600,
-                _ => 15,
-            };
             {
                 let mut guard = lock(shared);
                 if let Some(entry) = guard.entry_mut(serial) {
+                    entry.failures = entry.failures.saturating_add(1);
+                    // 15 s, 30 s, 1 min ... capped at 5 min, so a broken device
+                    // does not push files and pop up root prompts forever.
+                    let wait = match err {
+                        SetupError::UnsupportedAbi(_) => 3600,
+                        _ => (15u64 << (entry.failures - 1).min(5)).min(300),
+                    };
                     entry.state = DeviceState::Failed(err.to_string());
                     entry.retry_after = Some(Instant::now() + Duration::from_secs(wait));
                 }
@@ -870,8 +919,8 @@ fn unmount_one(shared: &SharedState, serial: &str) {
 }
 
 fn poll_devices(shared: &SharedState, bridge: &adb::DebugBridge) {
-    let devices = match bridge.get_devices() {
-        Ok(devices) => devices,
+    let (devices, problems) = match bridge.list_devices() {
+        Ok(found) => found,
         Err(err) => {
             let message = err.to_string();
             let changed = {
@@ -890,6 +939,7 @@ fn poll_devices(shared: &SharedState, bridge: &adb::DebugBridge) {
     {
         let mut guard = lock(shared);
         guard.adb_error = None;
+        guard.problems = problems;
         guard.devices.retain(|d| {
             serials.contains(&d.serial)
                 || matches!(
@@ -908,6 +958,7 @@ fn poll_devices(shared: &SharedState, bridge: &adb::DebugBridge) {
                     retry_after: None,
                     info: None,
                     su_style: None,
+                    failures: 0,
                 });
                 guard.push_log(format!("Device detected: {serial}"));
             }
@@ -972,6 +1023,95 @@ fn poll_devices(shared: &SharedState, bridge: &adb::DebugBridge) {
     }
 }
 
+fn adb_connect(bridge: &adb::DebugBridge, host: &str) -> Result<(), String> {
+    match bridge.invoke_timeout(
+        vec!["connect".to_string(), host.to_string()],
+        Duration::from_secs(8),
+    ) {
+        Ok(out) => {
+            let text = output_text(&out);
+            if daemon_cmd::connect_succeeded(&text) {
+                Ok(())
+            } else {
+                Err(text)
+            }
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn connect_command(shared: &SharedState, bridge: &adb::DebugBridge, input: &str) {
+    let Some(host) = daemon_cmd::normalize_adb_host(input) else {
+        ui_error(shared, format!("\"{input}\" is not a valid address (use ip or ip:port)"));
+        return;
+    };
+    ui_info(shared, format!("Connecting to {host}"));
+    match adb_connect(bridge, &host) {
+        Ok(()) => {
+            ui_info(shared, format!("Connected to {host}"));
+            let snapshot = {
+                let mut guard = lock(shared);
+                if guard.settings.hosts.contains(&host) {
+                    None
+                } else {
+                    guard.settings.hosts.push(host.clone());
+                    Some(guard.settings.clone())
+                }
+            };
+            if let Some(settings) = snapshot {
+                let _ = crate::settings::save(&settings);
+            }
+        }
+        Err(text) => ui_error(
+            shared,
+            format!("Could not connect to {host}: {text}. Check that the device is on the same network and ADB over network is enabled (adb tcpip 5555)."),
+        ),
+    }
+}
+
+fn forget_command(shared: &SharedState, bridge: &adb::DebugBridge, host: &str) {
+    let snapshot = {
+        let mut guard = lock(shared);
+        guard.settings.hosts.retain(|saved| saved != host);
+        guard.settings.clone()
+    };
+    let _ = crate::settings::save(&snapshot);
+    let _ = bridge.invoke_timeout(
+        vec!["disconnect".to_string(), host.to_string()],
+        Duration::from_secs(5),
+    );
+    ui_info(shared, format!("Forgot {host}"));
+}
+
+/// Reconnects saved network devices that are not in the device list. Runs on
+/// its own thread so an unreachable host cannot stall mounting.
+fn reconnect_saved_hosts(shared: &SharedState, bridge: &adb::DebugBridge) {
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    if RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let shared = shared.clone();
+    let bridge = bridge.clone();
+    std::thread::spawn(move || {
+        let missing: Vec<String> = {
+            let guard = lock(&shared);
+            guard
+                .settings
+                .hosts
+                .iter()
+                .filter(|host| !guard.devices.iter().any(|d| &d.serial == *host))
+                .cloned()
+                .collect()
+        };
+        for host in missing {
+            if let Err(text) = adb_connect(&bridge, &host) {
+                debug!("reconnect {host}: {text}");
+            }
+        }
+        RUNNING.store(false, Ordering::SeqCst);
+    });
+}
+
 pub fn spawn_engine(shared: SharedState) {
     std::thread::spawn(move || engine_loop(shared));
 }
@@ -984,6 +1124,7 @@ fn engine_loop(shared: SharedState) {
 
     let mut last_poll = Instant::now() - Duration::from_secs(60);
     let mut force_poll = true;
+    let mut last_reconnect = Instant::now() - Duration::from_secs(600);
     loop {
         let (quit, adb_wanted) = {
             let guard = lock(&shared);
@@ -1003,12 +1144,28 @@ fn engine_loop(shared: SharedState) {
         let commands: Vec<Command> = lock(&shared).commands.drain(..).collect();
         for command in commands {
             match command {
-                Command::Refresh => force_poll = true,
+                Command::Refresh => {
+                    force_poll = true;
+                    last_reconnect = Instant::now() - Duration::from_secs(600);
+                }
+                Command::Connect(host) => {
+                    connect_command(&shared, &bridge, &host);
+                    force_poll = true;
+                }
+                Command::Forget(host) => {
+                    forget_command(&shared, &bridge, &host);
+                    force_poll = true;
+                }
                 Command::Mount(serial) => mount_now(&shared, &bridge, &serial),
                 Command::Unmount(serial) => unmount_one(&shared, &serial),
             }
         }
 
+        if last_reconnect.elapsed() >= Duration::from_secs(60) {
+            last_reconnect = Instant::now();
+            reconnect_saved_hosts(&shared, &bridge);
+            force_poll = true;
+        }
         if force_poll || last_poll.elapsed() >= POLL_INTERVAL {
             force_poll = false;
             last_poll = Instant::now();

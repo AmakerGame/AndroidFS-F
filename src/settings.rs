@@ -12,6 +12,9 @@ use crate::daemon_cmd::AccessMode;
 pub struct DeviceSetting {
     pub access_mode: Option<AccessMode>,
     pub root: Option<String>,
+    pub read_only: Option<bool>,
+    /// Preferred drive letter such as `R:`; remembered after the first mount.
+    pub letter: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,17 +28,29 @@ pub struct Settings {
     pub access_mode: AccessMode,
     /// Per-device overrides, keyed by adb serial.
     pub per_device: BTreeMap<String, DeviceSetting>,
+    /// Protect the phone: Windows may not write, delete or rename anything.
+    pub read_only: bool,
+    /// Network devices (`ip:port`) reconnected automatically with `adb connect`.
+    pub hosts: Vec<String>,
 }
 
 impl Settings {
-    /// Access mode and drive root that apply to this device.
-    pub fn effective(&self, serial: &str) -> (AccessMode, String) {
+    /// Access mode, drive root and read-only flag that apply to this device.
+    pub fn effective(&self, serial: &str) -> Effective {
         let over = self.per_device.get(serial);
-        (
-            over.and_then(|d| d.access_mode).unwrap_or(self.access_mode),
-            over.and_then(|d| d.root.clone()).unwrap_or_else(|| self.root.clone()),
-        )
+        Effective {
+            access_mode: over.and_then(|d| d.access_mode).unwrap_or(self.access_mode),
+            root: over.and_then(|d| d.root.clone()).unwrap_or_else(|| self.root.clone()),
+            read_only: over.and_then(|d| d.read_only).unwrap_or(self.read_only),
+        }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct Effective {
+    pub access_mode: AccessMode,
+    pub root: String,
+    pub read_only: bool,
 }
 
 impl Default for Settings {
@@ -46,6 +61,8 @@ impl Default for Settings {
             adb_path: String::new(),
             access_mode: AccessMode::Auto,
             per_device: BTreeMap::new(),
+            read_only: false,
+            hosts: Vec::new(),
         }
     }
 }
@@ -82,6 +99,8 @@ pub fn load() -> Settings {
                 match field {
                     "access" => entry.access_mode = Some(AccessMode::parse(value)),
                     "root" => entry.root = Some(value.to_string()),
+                    "readonly" => entry.read_only = Some(value == "true"),
+                    "letter" => entry.letter = Some(value.trim().to_string()),
                     _ => {}
                 }
             }
@@ -92,6 +111,14 @@ pub fn load() -> Settings {
             "root" => settings.root = value.to_string(),
             "adb_path" => settings.adb_path = value.to_string(),
             "access_mode" => settings.access_mode = AccessMode::parse(value),
+            "read_only" => settings.read_only = value == "true",
+            "host" => {
+                if let Some(host) = crate::daemon_cmd::normalize_adb_host(value) {
+                    if !settings.hosts.contains(&host) {
+                        settings.hosts.push(host);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -107,7 +134,17 @@ pub fn save(settings: &Settings) -> std::io::Result<()> {
         settings.adb_path.trim(),
         settings.access_mode.as_str()
     );
+    text.push_str(&format!("read_only={}\n", settings.read_only));
+    for host in &settings.hosts {
+        text.push_str(&format!("host={host}\n"));
+    }
     for (serial, device) in &settings.per_device {
+        if let Some(letter) = &device.letter {
+            text.push_str(&format!("device.{serial}.letter={letter}\n"));
+        }
+        if let Some(read_only) = device.read_only {
+            text.push_str(&format!("device.{serial}.readonly={read_only}\n"));
+        }
         if let Some(mode) = device.access_mode {
             text.push_str(&format!("device.{serial}.access={}\n", mode.as_str()));
         }
