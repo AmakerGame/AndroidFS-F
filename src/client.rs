@@ -1,6 +1,8 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use dokan::OperationError;
@@ -72,15 +74,24 @@ pub fn convert_response<T>(resp: Result<T>) -> std::result::Result<T, OperationE
     resp.map_err(convert_error)
 }
 
+/// A request that gets no answer for this long fails instead of freezing
+/// Explorer forever (phone asleep, Wi-Fi dropped, cable pulled).
+const IO_TIMEOUT: Duration = Duration::from_secs(90);
+
 pub struct Client {
     connection: Mutex<TcpStream>,
+    /// Set after an I/O error: the stream may be half-read, so it must not be reused.
+    broken: AtomicBool,
 }
 
 impl Client {
     pub fn new(tcp_stream: TcpStream) -> Client {
         let _ = tcp_stream.set_nodelay(true);
+        let _ = tcp_stream.set_read_timeout(Some(IO_TIMEOUT));
+        let _ = tcp_stream.set_write_timeout(Some(IO_TIMEOUT));
         Client {
             connection: Mutex::new(tcp_stream),
+            broken: AtomicBool::new(false),
         }
     }
 
@@ -124,10 +135,25 @@ impl Client {
         &self,
         request: requests::Request,
     ) -> Result<(T, MutexGuard<'_, TcpStream>)> {
-        let mut connection = self.connection.lock().unwrap();
-        Self::write_request(&mut connection, &request)?;
-        let data = Self::read_response::<T>(&mut connection)?;
-        Ok((data, connection))
+        if self.broken.load(Ordering::SeqCst) {
+            return Err(Error::IOFailed(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "the connection to the device was lost",
+            )));
+        }
+        // A panic in another request must not take the whole drive down.
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let outcome = Self::write_request(&mut connection, &request)
+            .and_then(|()| Self::read_response::<T>(&mut connection));
+        match outcome {
+            Ok(data) => Ok((data, connection)),
+            Err(err) => {
+                if matches!(err, Error::IOFailed(_) | Error::ReceivedInvalidData(_)) {
+                    self.broken.store(true, Ordering::SeqCst);
+                }
+                Err(err)
+            }
+        }
     }
 
     fn send<T: DeserializeOwned>(&self, request: requests::Request) -> Result<T> {

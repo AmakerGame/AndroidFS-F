@@ -15,6 +15,10 @@ pub struct DeviceSetting {
     pub read_only: Option<bool>,
     /// Preferred drive letter such as `R:`; remembered after the first mount.
     pub letter: Option<String>,
+    /// Volume name shown in Explorer (empty/None = `Android <serial>`).
+    pub label: Option<String>,
+    pub hide_dotfiles: Option<bool>,
+    pub removable: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +36,14 @@ pub struct Settings {
     pub read_only: bool,
     /// Network devices (`ip:port`) reconnected automatically with `adb connect`.
     pub hosts: Vec<String>,
+    /// Names starting with a dot get the Windows hidden attribute.
+    pub hide_dotfiles: bool,
+    /// Show the drive as removable (Explorer offers Eject).
+    pub removable: bool,
+    /// How often folder listings are refreshed, in seconds (1-300).
+    pub refresh_secs: u32,
+    /// Open the drive in Explorer right after it is mounted.
+    pub open_after_mount: bool,
 }
 
 impl Settings {
@@ -42,6 +54,11 @@ impl Settings {
             access_mode: over.and_then(|d| d.access_mode).unwrap_or(self.access_mode),
             root: over.and_then(|d| d.root.clone()).unwrap_or_else(|| self.root.clone()),
             read_only: over.and_then(|d| d.read_only).unwrap_or(self.read_only),
+            label: over.and_then(|d| d.label.clone()).unwrap_or_default(),
+            hide_dotfiles: over.and_then(|d| d.hide_dotfiles).unwrap_or(self.hide_dotfiles),
+            removable: over.and_then(|d| d.removable).unwrap_or(self.removable),
+            refresh_secs: self.refresh_secs.clamp(1, 300),
+            open_after_mount: self.open_after_mount,
         }
     }
 }
@@ -51,6 +68,11 @@ pub struct Effective {
     pub access_mode: AccessMode,
     pub root: String,
     pub read_only: bool,
+    pub label: String,
+    pub hide_dotfiles: bool,
+    pub removable: bool,
+    pub refresh_secs: u32,
+    pub open_after_mount: bool,
 }
 
 impl Default for Settings {
@@ -63,6 +85,10 @@ impl Default for Settings {
             per_device: BTreeMap::new(),
             read_only: false,
             hosts: Vec::new(),
+            hide_dotfiles: false,
+            removable: false,
+            refresh_secs: 10,
+            open_after_mount: false,
         }
     }
 }
@@ -101,6 +127,9 @@ pub fn load() -> Settings {
                     "root" => entry.root = Some(value.to_string()),
                     "readonly" => entry.read_only = Some(value == "true"),
                     "letter" => entry.letter = Some(value.trim().to_string()),
+                    "label" => entry.label = Some(value.to_string()),
+                    "hide_dotfiles" => entry.hide_dotfiles = Some(value == "true"),
+                    "removable" => entry.removable = Some(value == "true"),
                     _ => {}
                 }
             }
@@ -112,6 +141,12 @@ pub fn load() -> Settings {
             "adb_path" => settings.adb_path = value.to_string(),
             "access_mode" => settings.access_mode = AccessMode::parse(value),
             "read_only" => settings.read_only = value == "true",
+            "hide_dotfiles" => settings.hide_dotfiles = value == "true",
+            "removable" => settings.removable = value == "true",
+            "refresh_secs" => {
+                settings.refresh_secs = value.trim().parse().unwrap_or(10).clamp(1, 300)
+            }
+            "open_after_mount" => settings.open_after_mount = value == "true",
             "host" => {
                 if let Some(host) = crate::daemon_cmd::normalize_adb_host(value) {
                     if !settings.hosts.contains(&host) {
@@ -134,11 +169,27 @@ pub fn save(settings: &Settings) -> std::io::Result<()> {
         settings.adb_path.trim(),
         settings.access_mode.as_str()
     );
-    text.push_str(&format!("read_only={}\n", settings.read_only));
+    text.push_str(&format!(
+        "read_only={}\nhide_dotfiles={}\nremovable={}\nrefresh_secs={}\nopen_after_mount={}\n",
+        settings.read_only,
+        settings.hide_dotfiles,
+        settings.removable,
+        settings.refresh_secs.clamp(1, 300),
+        settings.open_after_mount
+    ));
     for host in &settings.hosts {
         text.push_str(&format!("host={host}\n"));
     }
     for (serial, device) in &settings.per_device {
+        if let Some(label) = device.label.as_deref().filter(|l| !l.trim().is_empty()) {
+            text.push_str(&format!("device.{serial}.label={}\n", label.trim()));
+        }
+        if let Some(value) = device.hide_dotfiles {
+            text.push_str(&format!("device.{serial}.hide_dotfiles={value}\n"));
+        }
+        if let Some(value) = device.removable {
+            text.push_str(&format!("device.{serial}.removable={value}\n"));
+        }
         if let Some(letter) = &device.letter {
             text.push_str(&format!("device.{serial}.letter={letter}\n"));
         }

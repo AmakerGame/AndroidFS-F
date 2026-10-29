@@ -164,7 +164,7 @@ pub fn parse_uid(output: &str) -> Option<u32> {
     }
 }
 
-/// Turns user input like `192.168.0.5` into `192.168.0.5:5555`; rejects anything
+/// Turns user input like `192.0.2.5` into `192.0.2.5:5555`; rejects anything
 /// that is not a plain host name or address with an optional port.
 pub fn normalize_adb_host(input: &str) -> Option<String> {
     let text = input.trim();
@@ -309,15 +309,15 @@ mod tests {
 
     #[test]
     fn adb_hosts() {
-        assert_eq!(normalize_adb_host("192.168.0.5").as_deref(), Some("192.168.0.5:5555"));
+        assert_eq!(normalize_adb_host("192.0.2.5").as_deref(), Some("192.0.2.5:5555"));
         assert_eq!(normalize_adb_host(" box.local:6000 ").as_deref(), Some("box.local:6000"));
         assert_eq!(normalize_adb_host("a:b:c"), None);
         assert_eq!(normalize_adb_host("1.2.3.4:0"), None);
         assert_eq!(normalize_adb_host("1.2.3.4; rm"), None);
         assert_eq!(normalize_adb_host(""), None);
-        assert!(connect_succeeded("connected to 192.168.0.5:5555"));
-        assert!(connect_succeeded("already connected to 192.168.0.5:5555\r\n"));
-        assert!(!connect_succeeded("failed to connect to '192.168.0.5:5555': Connection refused"));
+        assert!(connect_succeeded("connected to 192.0.2.5:5555"));
+        assert!(connect_succeeded("already connected to 192.0.2.5:5555\r\n"));
+        assert!(!connect_succeeded("failed to connect to '192.0.2.5:5555': Connection refused"));
         assert!(!connect_succeeded("cannot connect to 1.2.3.4:5555: timed out (10060)"));
     }
 

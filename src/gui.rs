@@ -129,6 +129,21 @@ impl App {
             {
                 entry.read_only = Some(read_only);
             }
+            let mut label = entry.label.clone().unwrap_or_default();
+            ui.add(
+                egui::TextEdit::singleline(&mut label)
+                    .hint_text("Drive name (default: Android <serial>)")
+                    .desired_width(220.0),
+            );
+            entry.label = if label.trim().is_empty() { None } else { Some(label.chars().take(32).collect()) };
+            let mut hide = entry.hide_dotfiles.unwrap_or(self.form.hide_dotfiles);
+            if ui.checkbox(&mut hide, "Hide names that start with a dot").changed() {
+                entry.hide_dotfiles = Some(hide);
+            }
+            let mut removable = entry.removable.unwrap_or(self.form.removable);
+            if ui.checkbox(&mut removable, "Show as removable drive").changed() {
+                entry.removable = Some(removable);
+            }
             let mut root = entry.root.clone().unwrap_or_default();
             ui.add(
                 egui::TextEdit::singleline(&mut root)
@@ -157,7 +172,7 @@ impl App {
                 entry.root = if root.is_empty() { None } else { Some(root) };
             }
             ui.label(
-                egui::RichText::new("Unmount and Mount again to apply. With root and no folder, the whole device (/) is shown.")
+                egui::RichText::new("Use Remount to apply. With root and no folder, the whole device (/) is shown.")
                     .small()
                     .color(MUTED),
             );
@@ -215,7 +230,7 @@ impl App {
             ui.label("Network device:");
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.connect_text)
-                    .hint_text("192.168.0.50 or 192.168.0.50:5555")
+                    .hint_text("ip or ip:port, e.g. 192.168.1.20")
                     .desired_width(230.0),
             );
             let enter = response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
@@ -329,6 +344,9 @@ impl App {
                                 if ui.button("Unmount").clicked() {
                                     self.send(Command::Unmount(device.serial.clone()));
                                 }
+                                if ui.button("Remount").clicked() {
+                                    self.send(Command::Remount(device.serial.clone()));
+                                }
                             }
                             DeviceState::Mounting | DeviceState::Unmounting => {
                                 ui.spinner();
@@ -404,8 +422,35 @@ impl App {
                 "Root (su) - full access on rooted phones; approve the request on the phone",
             );
             ui.label(
-                egui::RichText::new("Applies the next time a device is mounted (Unmount, then Mount).")
+                egui::RichText::new("Applies the next time a device is mounted (use Remount on the Devices tab).")
                     .color(MUTED),
+            );
+        });
+        ui.add_space(8.0);
+
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Disk").strong());
+            ui.checkbox(
+                &mut self.form.hide_dotfiles,
+                "Hide names that start with a dot (Windows hidden attribute)",
+            );
+            ui.checkbox(
+                &mut self.form.removable,
+                "Show as removable drive (Explorer offers Eject)",
+            );
+            ui.checkbox(
+                &mut self.form.open_after_mount,
+                "Open the drive in Explorer after mounting",
+            );
+            ui.add(
+                egui::Slider::new(&mut self.form.refresh_secs, 1..=120)
+                    .text("Folder refresh (seconds)"),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Lower values show changes made on the phone sooner but use more ADB traffic. Use Remount to apply.",
+                )
+                .color(MUTED),
             );
         });
         ui.add_space(8.0);

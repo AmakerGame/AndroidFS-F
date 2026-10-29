@@ -6,7 +6,7 @@ use widestring::{U16CStr, U16CString};
 use winapi::shared::ntstatus::*;
 use winapi::um::winnt::{
     self, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
-    FILE_ATTRIBUTE_RECALL_ON_OPEN, PSECURITY_DESCRIPTOR,
+    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_RECALL_ON_OPEN, PSECURITY_DESCRIPTOR,
 };
 
 use crate::cache::Cache;
@@ -24,7 +24,26 @@ const FILE_OVERWRITE_IF: u32 = 5;
 const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 
+/// Disk behaviour chosen in Settings.
+#[derive(Clone, Copy, Debug)]
+pub struct DiskOptions {
+    /// Give names that start with a dot the Windows "hidden" attribute.
+    pub hide_dotfiles: bool,
+    /// How long folder listings are cached (seconds).
+    pub refresh_secs: u64,
+}
+
+impl Default for DiskOptions {
+    fn default() -> Self {
+        DiskOptions {
+            hide_dotfiles: false,
+            refresh_secs: 10,
+        }
+    }
+}
+
 pub struct QuestFsHandler {
+    options: DiskOptions,
     volume_name: U16CString,
     client: Client,
     directory_cache: Cache<String, Vec<models::FileInfo>>,
@@ -89,13 +108,23 @@ fn convert_attributes(file: &models::FileInfo) -> u32 {
 }
 
 impl QuestFsHandler {
-    pub fn new(client: Client, volume_name: U16CString) -> Self {
+    pub fn new(client: Client, volume_name: U16CString, options: DiskOptions) -> Self {
+        let refresh = options.refresh_secs.clamp(1, 300);
         QuestFsHandler {
+            options,
             volume_name,
             client,
-            directory_cache: Cache::new(Duration::from_secs(10), 128),
-            stat_cache: Cache::new(Duration::from_secs(3), 1024),
+            directory_cache: Cache::new(Duration::from_secs(refresh), 128),
+            stat_cache: Cache::new(Duration::from_secs(refresh.min(3)), 1024),
         }
+    }
+
+    fn attributes(&self, file: &models::FileInfo) -> u32 {
+        let mut attributes = convert_attributes(file);
+        if self.options.hide_dotfiles && file.name.starts_with('.') && file.name != "." {
+            attributes |= FILE_ATTRIBUTE_HIDDEN;
+        }
+        attributes
     }
 
     fn stat_cached(&self, path: &str) -> client::Result<models::FileInfo> {
@@ -336,7 +365,7 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for QuestFsHandler {
         let path = convert_file_name(win_file_name);
         let file_info = client::convert_response(self.stat_cached(&path))?;
         Ok(FileInfo {
-            attributes: convert_attributes(&file_info),
+            attributes: self.attributes(&file_info),
             creation_time: file_info.creation_time,
             last_access_time: file_info.last_accessed,
             last_write_time: file_info.last_modified,
@@ -367,7 +396,7 @@ impl<'a, 'b: 'a> FileSystemHandler<'a, 'b> for QuestFsHandler {
                 continue;
             };
             let result = fill_find_data(&FindData {
-                attributes: convert_attributes(file),
+                attributes: self.attributes(file),
                 creation_time: file.creation_time,
                 last_access_time: file.last_accessed,
                 last_write_time: file.last_modified,

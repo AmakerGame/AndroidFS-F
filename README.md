@@ -105,6 +105,9 @@ Each device in the **Devices** tab has its own *Access for this device* section 
 - **SD card / USB drive as the drive root** (`SD / USB` button, value `@external`): the first removable storage under `/storage`, handy for TV boxes.
 - **Open adb shell** for a device in one click, and **Copy diagnostics** in the Log tab for bug reports.
 - The log rolls over at 2 MB, and unreachable saved network hosts are retried in the background without delaying mounts.
+- **Remount** button: applies changed access mode, folder, letter or read-only setting without re-plugging the device.
+- **No more frozen Explorer:** a request the phone does not answer within 90 s fails instead of hanging, and a lost connection is detected immediately.
+- **Disk settings** (Settings > *Disk*, most can be overridden per device): drive name, hide dot-files (Windows hidden attribute), show as removable drive (Eject), open Explorer after mounting, folder refresh interval (1-120 s), drive letter and read-only mode.
 - **Correct free space** is reported when the drive root is `/` or `/storage`, so Windows no longer refuses to copy because the root file system looks full.
 
 ## Building from source
@@ -150,6 +153,8 @@ On connection the application pushes the matching daemon to `/data/local/tmp`, s
 | "ADB is not available" | Install platform-tools and add `adb.exe` to `PATH`, or set its path in Settings |
 | Phone not listed | Enable USB debugging, reconnect the cable and accept the key prompt on the phone |
 | Status *Failed* with a Dokan message | Install Dokan 1.5.x and restart Windows |
+| Drive mounts but looks empty | Open the Log tab: it shows the access mode and how many entries the phone reports. On a rooted device set the access mode to Root (or Auto) for this device |
+| Device shown as *unauthorized* | Unlock the phone and tap Allow on the USB debugging prompt |
 | Window does not open | Update the graphics driver; the window needs OpenGL 2.0 |
 | "Already running" message | Another instance is open; find it in the taskbar |
 
@@ -173,6 +178,7 @@ Open the **Log** tab, or `%APPDATA%\AndroidFS-F\androidfs.log`, for details.
 - The drive root is the phone's shared storage; ADB failures no longer stop the application.
 - Symbolic links to directories are shown as directories.
 - 0.4.0: fixed the drive mounting but looking empty (the host connected through `adb forward` before the daemon was listening; a `Hello` handshake with a token is now required), folders no longer carry cloud-placeholder flags, one over-long name no longer aborts a listing, `adb forward --no-rebind`, root / non-root access modes, and a post-mount self-check in the log.
+- 0.5.0: network devices (`adb connect`, remembered), read-only mode, preserved file dates, per-device settings (access, folder, drive letter, name, hidden dot-files, removable), SD card / USB drive as drive root, Remount, request timeouts, correct free space with a `/` root, clearer messages for unauthorized/offline devices, retry back-off, log rotation. See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

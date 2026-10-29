@@ -20,7 +20,7 @@ use crate::client::Client;
 use crate::daemon_cmd::{
     self, Access, AccessMode, SuStyle, DAEMON_PORT, KILL_SCRIPT, SERVER_PATH, SU_STYLES,
 };
-use crate::file_system::QuestFsHandler;
+use crate::file_system::{DiskOptions, QuestFsHandler};
 use crate::responses;
 use crate::settings::Settings;
 
@@ -84,6 +84,8 @@ pub enum Command {
     Refresh,
     Mount(String),
     Unmount(String),
+    /// Unmount, then mount again (applies changed access settings).
+    Remount(String),
     /// `adb connect` to a network device and remember it.
     Connect(String),
     /// Disconnect a network device and stop reconnecting it.
@@ -573,7 +575,7 @@ fn setup(device: adb::Device, shared: &SharedState) -> Result<String, SetupError
         }
     }
 
-    let (letter, root, mode, read_only) = {
+    let (letter, eff) = {
         let mut guard = lock(shared);
         let preferred = guard
             .settings
@@ -584,10 +586,10 @@ fn setup(device: adb::Device, shared: &SharedState) -> Result<String, SetupError
             .ok_or(SetupError::NoAvailableDriveLetter)?;
         guard.reserved.insert(letter.to_string());
         let eff = guard.settings.effective(&serial);
-        (letter.to_string(), eff.root, eff.access_mode, eff.read_only)
+        (letter.to_string(), eff)
     };
 
-    let result = setup_reserved(device, shared, &letter, binary, &root, mode, read_only);
+    let result = setup_reserved(device, shared, &letter, binary, &eff);
     if result.is_err() {
         lock(shared).reserved.remove(&letter);
     }
@@ -644,10 +646,11 @@ fn setup_reserved(
     shared: &SharedState,
     letter: &str,
     binary: &'static [u8],
-    root_setting: &str,
-    mode: AccessMode,
-    read_only: bool,
+    eff: &crate::settings::Effective,
 ) -> Result<String, SetupError> {
+    let root_setting = eff.root.as_str();
+    let mode = eff.access_mode;
+    let read_only = eff.read_only;
     let port = forward_free_port(&device)?;
     debug!("Forwarded tcp:{port} -> tcp:{DAEMON_PORT}");
 
@@ -707,7 +710,16 @@ fn setup_reserved(
         ui_info(shared, format!("{serial}: mounted read-only"));
     }
     let stream = session.stream;
-    let label = volume_label(&serial);
+    let label = if eff.label.trim().is_empty() {
+        volume_label(&serial)
+    } else {
+        sanitize_label(&eff.label)
+    };
+    let options = DiskOptions {
+        hide_dotfiles: eff.hide_dotfiles,
+        refresh_secs: u64::from(eff.refresh_secs),
+    };
+    let removable = eff.removable;
     let volume_name =
         U16CString::from_str(&label).unwrap_or_else(|_| U16CString::from_str("Android").unwrap());
     let mount_point = U16CString::from_str(letter).unwrap();
@@ -722,11 +734,14 @@ fn setup_reserved(
         let mount_error = mount_error.clone();
         std::thread::spawn(move || {
             let serial = serial_for_mount;
-            let handler = QuestFsHandler::new(Client::new(stream), volume_name);
+            let handler = QuestFsHandler::new(Client::new(stream), volume_name, options);
             let mut failure: Option<String> = None;
             let mut flags = MountFlags::CASE_SENSITIVE;
             if read_only {
                 flags |= MountFlags::WRITE_PROTECT;
+            }
+            if removable {
+                flags |= MountFlags::REMOVABLE;
             }
             match Drive::new()
                 .mount_point(&mount_point)
@@ -838,7 +853,22 @@ fn setup_reserved(
         Err(err) => ui_error(shared, format!("{serial}: cannot list {drive_path}: {err}")),
     }
 
+    if eff.open_after_mount {
+        let _ = std::process::Command::new("explorer.exe").arg(&drive_path).spawn();
+    }
+
     Ok(letter.to_string())
+}
+
+/// Volume names are limited to 32 characters and may not hold control characters.
+fn sanitize_label(label: &str) -> String {
+    label
+        .chars()
+        .filter(|ch| !ch.is_control() && !matches!(ch, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .take(32)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn volume_label(serial: &str) -> String {
@@ -1158,6 +1188,27 @@ fn engine_loop(shared: SharedState) {
                 }
                 Command::Mount(serial) => mount_now(&shared, &bridge, &serial),
                 Command::Unmount(serial) => unmount_one(&shared, &serial),
+                Command::Remount(serial) => {
+                    unmount_one(&shared, &serial);
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    loop {
+                        let gone = {
+                            let mut guard = lock(&shared);
+                            guard.entry_mut(&serial).map_or(true, |entry| {
+                                matches!(entry.state, DeviceState::Detected | DeviceState::Failed(_))
+                            })
+                        };
+                        if gone {
+                            mount_now(&shared, &bridge, &serial);
+                            break;
+                        }
+                        if Instant::now() >= deadline {
+                            ui_error(&shared, format!("{serial}: the drive did not unmount in time; close programs using it and try again"));
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
             }
         }
 

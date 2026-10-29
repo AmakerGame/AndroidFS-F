@@ -67,12 +67,12 @@ mod tests {
 
     #[test]
     fn finds_problem_devices() {
-        let out = "List of devices attached\nAAA\tunauthorized\nBBB\tdevice\r\n192.168.0.9:5555\toffline\n";
+        let out = "List of devices attached\nAAA\tunauthorized\nBBB\tdevice\r\n192.0.2.9:5555\toffline\n";
         assert_eq!(
             super::parse_problem_devices(out),
             vec![
                 ("AAA".to_string(), "unauthorized".to_string()),
-                ("192.168.0.9:5555".to_string(), "offline".to_string())
+                ("192.0.2.9:5555".to_string(), "offline".to_string())
             ]
         );
     }
